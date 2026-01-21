@@ -1,0 +1,19 @@
+{
+  "printer_1767814531576": {
+    "ip": "192.168.126.32",
+    "name": "ZT411-Test-Office",
+    "description": "printer for testing",
+    "addedAt": "2026-01-07T19:35:34.582Z",
+    "lastChecked": "2026-01-21T00:58:15.606Z",
+    "status": "online",
+    "lastPrint": "2026-01-21T00:55:50.480Z",
+    "continuousPrint": {
+      "active": false,
+      "zpl": "^XA\n^PW812\n^LL406\n^CI28\n^FO100,140\n^BY3\n^BCN,80,N,N,N\n^FD>;>801107919284676441326011810049656^FS\n^FO20,60\n^A0N,28,28\n^FD120-5# FB CHOICE RF B SCDY NAV NC^FS\n^FO500,20\n^A0N,32,32\n^FDPROD. OF USA^FS\n^FO20,320\n^A0N,26,26\n^FDKings River Packing^FS\n^FO20,350\n^A0N,26,26\n^FDSanger, CA 93657^FS\n^FO300,320\n^BUN,50,Y,N,N\n^FD686201859618^FS\n^FO660,260\n^A0N,18,18\n^FDPack Date^FS\n^FO660,320\n^GB120,60,2^FS\n^FO670,325\n^A0N,36,36\n^FD11-99^FS\n^FO660,280\n^A0N,24,24\n^FDJAN18^FS\n^FO20,20\n^A0N,32,32\n^FDNAVEL ORANGE^FS\n^FO220,228\n^A0N,20,20\n^FD(01)10791928467644(13)260118(10)049656^FS\n^XZ",
+      "pollInterval": 200,
+      "count": 3,
+      "startedAt": "2026-01-20T00:02:43.281Z",
+      "waitingForPeel": false
+    }
+  }
+}

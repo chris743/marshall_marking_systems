@@ -1,0 +1,2601 @@
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const net = require('net');
+const fs = require('fs');
+const path = require('path');
+const { sql, getPool, isConfigured } = require('./sqlServerClient');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+const PRINTER_PORT = 6101; // Default Zebra printer port
+const PRINTER_TIMEOUT = 5000; // 5 second timeout
+const PRINTERS_FILE = path.join(__dirname, 'printers.json');
+
+// In-memory printer storage
+let printers = {};
+
+// Load printers from file on startup
+function loadPrinters() {
+  try {
+    if (fs.existsSync(PRINTERS_FILE)) {
+      const data = fs.readFileSync(PRINTERS_FILE, 'utf8');
+      printers = JSON.parse(data);
+      console.log(`Loaded ${Object.keys(printers).length} printers from storage`);
+    }
+  } catch (error) {
+    console.error('Error loading printers:', error.message);
+    printers = {};
+  }
+}
+
+// Save printers to file
+function savePrinters() {
+  try {
+    const jsonData = JSON.stringify(printers, null, 2);
+    fs.writeFileSync(PRINTERS_FILE, jsonData);
+    console.log(`→ Saved ${Object.keys(printers).length} printers to ${PRINTERS_FILE}`);
+  } catch (error) {
+    console.error('✗ Error saving printers:', error.message);
+  }
+}
+
+// Send ZPL to printer via TCP/IP
+function sendZPL(ip, zpl, timeout = PRINTER_TIMEOUT) {
+  return new Promise((resolve, reject) => {
+    const client = new net.Socket();
+    let responseData = '';
+    
+    // Set timeout
+    client.setTimeout(timeout);
+    
+    client.connect(PRINTER_PORT, ip, () => {
+      console.log(`Connected to printer at ${ip}:${PRINTER_PORT}`);
+      client.write(zpl);
+    });
+    
+    client.on('data', (data) => {
+      responseData += data.toString();
+    });
+    
+    client.on('timeout', () => {
+      client.destroy();
+      reject(new Error('Connection timeout'));
+    });
+    
+    client.on('end', () => {
+      resolve(responseData);
+    });
+    
+    client.on('close', () => {
+      if (!client.destroyed) {
+        resolve(responseData);
+      }
+    });
+    
+    client.on('error', (err) => {
+      reject(err);
+    });
+    
+    // Auto-close after sending
+    setTimeout(() => {
+      if (!client.destroyed) {
+        client.end();
+      }
+    }, 1000);
+  });
+}
+
+// Check printer status via TCP/IP
+async function checkPrinterStatus(ip) {
+  return new Promise((resolve) => {
+    const client = new net.Socket();
+    const timeout = 3000;
+    let connected = false;
+    
+    // Set timeout
+    client.setTimeout(timeout);
+    
+    client.connect(PRINTER_PORT, ip, () => {
+      connected = true;
+      console.log(`✓ Printer at ${ip} is online`);
+      client.destroy();
+      resolve({ online: true, reachable: true });
+    });
+    
+    client.on('timeout', () => {
+      client.destroy();
+      console.log(`✗ Printer at ${ip} timed out`);
+      resolve({ online: false, reachable: false, error: 'Connection timeout' });
+    });
+    
+    client.on('error', (err) => {
+      console.log(`✗ Printer at ${ip} error: ${err.message}`);
+      if (!connected) {
+        client.destroy();
+        resolve({ online: false, reachable: false, error: err.message });
+      }
+    });
+    
+    client.on('close', () => {
+      if (!connected) {
+        resolve({ online: false, reachable: false, error: 'Connection closed' });
+      }
+    });
+  });
+}
+
+// Get peel sensor status using SGD command
+// Returns: "clear" = label taken/no label, "present" = label waiting to be taken
+async function getPeelSensorStatus(ip) {
+  return new Promise((resolve) => {
+    const client = new net.Socket();
+    let responseData = '';
+    
+    client.setTimeout(2000);
+    
+    client.connect(PRINTER_PORT, ip, () => {
+      // Send SGD getvar command for peel sensor
+      // Format: ! U1 getvar "sensor.peeler"
+      // Response will be "clear" or "present" (with quotes)
+      client.write('! U1 getvar "sensor.peeler"\r\n');
+    });
+    
+    client.on('data', (data) => {
+      responseData += data.toString();
+    });
+    
+    client.on('timeout', () => {
+      client.destroy();
+      resolve({ error: 'timeout', rawResponse: responseData });
+    });
+    
+    client.on('error', (err) => {
+      client.destroy();
+      resolve({ error: err.message, rawResponse: responseData });
+    });
+    
+    // Close connection after getting response
+    setTimeout(() => {
+      if (!client.destroyed) {
+        client.destroy();
+        
+        // Parse the response - it will be something like "clear" or "present"
+        const trimmed = responseData.trim();
+        console.log(`[PEEL SENSOR] Raw response: "${trimmed}"`);
+        
+        // Remove quotes if present
+        const value = trimmed.replace(/"/g, '').toLowerCase();
+        
+        // "clear" means label has been taken (or no label present)
+        // "present" means label is waiting at peel position
+        const labelTaken = value === 'clear';
+        const labelAtPeelPosition = value === 'present';
+        
+        resolve({
+          rawResponse: responseData,
+          sensorValue: value,
+          labelTaken: labelTaken,
+          labelAtPeelPosition: labelAtPeelPosition,
+          online: true
+        });
+      }
+    }, 500);
+  });
+}
+
+// Get printer status by sending ~HQES command for extended status
+async function getPrinterStatus(ip) {
+  return new Promise((resolve) => {
+    const client = new net.Socket();
+    let responseData = '';
+    
+    client.setTimeout(3000);
+    
+    client.connect(PRINTER_PORT, ip, () => {
+      // Send host query extended status - this includes peel sensor info
+      client.write('~HQES\r\n');
+    });
+    
+    client.on('data', (data) => {
+      responseData += data.toString();
+    });
+    
+    client.on('timeout', () => {
+      client.destroy();
+      resolve({ error: 'timeout', rawResponse: responseData });
+    });
+    
+    client.on('error', (err) => {
+      client.destroy();
+      resolve({ error: err.message, rawResponse: responseData });
+    });
+    
+    // Close connection after getting response
+    setTimeout(() => {
+      if (!client.destroyed) {
+        client.destroy();
+        
+        // Parse the response
+        // ~HQES returns a comma-separated list of values
+        // Format: Interface,Paper Out,Pause,Label Length,Number of Formats,Buffer Full,Diagnostic,Partial Format,Corrupt RAM,Under Temp,Over Temp
+        // For peel mode: position 7 (index 6) indicates if label is at peel position
+        
+        const values = responseData.trim().split(',');
+        
+        // Check various error conditions
+        const paperOut = values[1] === '1';
+        const paused = values[2] === '1';
+        const ribbonOut = values[7] === '1';
+        
+        // For peel sensor detection:
+        // When label is waiting at peel sensor, printer is typically in a "paused" state
+        // or we check the buffer status
+        const labelAtPeelPosition = paused || values[2] === '1';
+        const labelTaken = !labelAtPeelPosition;
+        
+        resolve({
+          rawResponse: responseData,
+          values: values,
+          paperOut: paperOut,
+          paused: paused,
+          ribbonOut: ribbonOut,
+          labelAtPeelPosition: labelAtPeelPosition,
+          labelTaken: labelTaken,
+          online: true
+        });
+      }
+    }, 500);
+  });
+}
+
+// Middleware
+app.use(cors());
+app.use(express.json());
+app.use(express.text({ type: 'text/plain' }));
+
+// Health check endpoint
+app.get('/api/health', (req, res) => {
+  res.json({
+    success: true,
+    status: 'running',
+    timestamp: new Date().toISOString(),
+    printerCount: Object.keys(printers).length
+  });
+});
+
+// List all printers
+app.get('/api/printers', (req, res) => {
+  const printerList = Object.entries(printers).map(([id, printer]) => ({
+    id,
+    ...printer
+  }));
+  
+  res.json({
+    success: true,
+    printers: printerList,
+    count: printerList.length
+  });
+});
+
+// Get specific printer
+app.get('/api/printers/:id', (req, res) => {
+  const { id } = req.params;
+  
+  if (!printers[id]) {
+    return res.status(404).json({
+      success: false,
+      error: 'Printer not found'
+    });
+  }
+  
+  res.json({
+    success: true,
+    printer: {
+      id,
+      ...printers[id]
+    }
+  });
+});
+
+// Add a new printer
+app.post('/api/printers', async (req, res) => {
+  try {
+    const { ip, name, description } = req.body;
+    
+    if (!ip) {
+      return res.status(400).json({
+        success: false,
+        error: 'IP address is required'
+      });
+    }
+    
+    // Validate IP format
+    const ipRegex = /^(\d{1,3}\.){3}\d{1,3}$/;
+    if (!ipRegex.test(ip)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid IP address format'
+      });
+    }
+    
+    // Generate unique ID
+    const id = `printer_${Date.now()}`;
+    
+    // Check if printer is reachable
+    const status = await checkPrinterStatus(ip);
+    
+    // Add printer
+    printers[id] = {
+      ip,
+      name: name || `ZT411-${ip}`,
+      description: description || '',
+      addedAt: new Date().toISOString(),
+      lastChecked: new Date().toISOString(),
+      status: status.online ? 'online' : 'offline'
+    };
+    
+    savePrinters();
+    
+    res.json({
+      success: true,
+      message: 'Printer added successfully',
+      printer: {
+        id,
+        ...printers[id]
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Update printer
+app.put('/api/printers/:id', (req, res) => {
+  try {
+    const { id } = req.params;
+    const { ip, name, description } = req.body;
+    
+    if (!printers[id]) {
+      return res.status(404).json({
+        success: false,
+        error: 'Printer not found'
+      });
+    }
+    
+    // Update fields
+    if (ip) {
+      const ipRegex = /^(\d{1,3}\.){3}\d{1,3}$/;
+      if (!ipRegex.test(ip)) {
+        return res.status(400).json({
+          success: false,
+          error: 'Invalid IP address format'
+        });
+      }
+      printers[id].ip = ip;
+    }
+    if (name) printers[id].name = name;
+    if (description !== undefined) printers[id].description = description;
+    
+    printers[id].updatedAt = new Date().toISOString();
+    savePrinters();
+    
+    res.json({
+      success: true,
+      message: 'Printer updated successfully',
+      printer: {
+        id,
+        ...printers[id]
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Remove printer
+app.delete('/api/printers/:id', (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    if (!printers[id]) {
+      return res.status(404).json({
+        success: false,
+        error: 'Printer not found'
+      });
+    }
+    
+    const deletedPrinter = printers[id];
+    delete printers[id];
+    savePrinters();
+    
+    res.json({
+      success: true,
+      message: 'Printer removed successfully',
+      printer: deletedPrinter
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Check printer status
+app.get('/api/printers/:id/status', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    if (!printers[id]) {
+      return res.status(404).json({
+        success: false,
+        error: 'Printer not found'
+      });
+    }
+    
+    const printer = printers[id];
+    console.log(`\nChecking status for printer: ${printer.name} (${printer.ip})`);
+    
+    const status = await checkPrinterStatus(printer.ip);
+    
+    // Update status
+    const newStatus = status.online ? 'online' : 'offline';
+    console.log(`Status result: ${newStatus}`);
+    
+    printers[id].status = newStatus;
+    printers[id].lastChecked = new Date().toISOString();
+    
+    console.log(`Saving printers.json with status: ${printers[id].status}`);
+    savePrinters();
+    console.log('Printers saved successfully');
+    
+    res.json({
+      success: true,
+      printer: {
+        id,
+        ...printers[id]
+      },
+      connectivity: status
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Get peel sensor status directly
+app.get('/api/printers/:id/peel-sensor', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    if (!printers[id]) {
+      return res.status(404).json({
+        success: false,
+        error: 'Printer not found'
+      });
+    }
+    
+    const printer = printers[id];
+    const peelStatus = await getPeelSensorStatus(printer.ip);
+    
+    res.json({
+      success: true,
+      printer: printer.name,
+      ip: printer.ip,
+      peelSensor: peelStatus
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Continuous print - waits for label to be taken before printing next
+app.post('/api/printers/:id/print/continuous', async (req, res) => {
+  const { id } = req.params;
+  
+  try {
+    const { zpl, pollInterval = 200 } = req.body;
+    
+    if (!printers[id]) {
+      return res.status(404).json({
+        success: false,
+        error: 'Printer not found'
+      });
+    }
+    
+    if (!zpl) {
+      return res.status(400).json({
+        success: false,
+        error: 'ZPL data is required'
+      });
+    }
+    
+    const printer = printers[id];
+    
+    // Store continuous print job
+    if (!printer.continuousPrint) {
+      printer.continuousPrint = {
+        active: true,
+        zpl: zpl,
+        pollInterval: pollInterval,
+        count: 0,
+        startedAt: new Date().toISOString(),
+        waitingForPeel: false
+      };
+    } else {
+      // Update existing job
+      printer.continuousPrint.active = true;
+      printer.continuousPrint.zpl = zpl;
+      printer.continuousPrint.pollInterval = pollInterval;
+      printer.continuousPrint.waitingForPeel = false;
+      printer.continuousPrint.count = 0;
+      printer.continuousPrint.startedAt = new Date().toISOString();
+    }
+    
+    printers[id] = printer;
+    savePrinters();
+    
+    // Start continuous printing loop with peel sensor polling using SGD command
+    // Strategy: Keep 2 labels queued (1 presented + 1 in buffer) for instant presentation
+    const continuousPrintLoop = async () => {
+      console.log(`Starting continuous print for ${printer.name} - using SGD sensor.peeler command`);
+      console.log(`Strategy: Maintaining 2-label queue (1 presented + 1 in buffer)`);
+      
+      // Track how many labels are "in flight" (printed but not yet taken)
+      let labelsInQueue = 0;
+      const TARGET_QUEUE_SIZE = 2; // 1 presented + 1 waiting in buffer
+      
+      // Initial queue fill - send 2 labels to start
+      console.log(`📄 Initial queue fill: sending ${TARGET_QUEUE_SIZE} labels to ${printer.name}`);
+      for (let i = 0; i < TARGET_QUEUE_SIZE; i++) {
+        try {
+          await sendZPL(printer.ip, printer.continuousPrint.zpl);
+          printer.continuousPrint.count++;
+          labelsInQueue++;
+          console.log(`  → Queued label ${printer.continuousPrint.count} (queue size: ${labelsInQueue})`);
+          // Small delay between sends to let printer process
+          await new Promise(resolve => setTimeout(resolve, 100));
+        } catch (error) {
+          console.error(`Failed to queue initial label: ${error.message}`);
+        }
+      }
+      
+      printers[id].status = 'online';
+      printers[id].lastPrint = new Date().toISOString();
+      
+      // Wait for first label to present
+      await new Promise(resolve => setTimeout(resolve, 500));
+      
+      // Main loop - replenish queue when label is taken
+      while (printer.continuousPrint && printer.continuousPrint.active) {
+        try {
+          // Check peel sensor status using SGD command
+          const peelStatus = await getPeelSensorStatus(printer.ip);
+          
+          // Debug logging
+          console.log(`[DEBUG] Peel sensor for ${printer.name}:`, {
+            sensorValue: peelStatus.sensorValue,
+            labelTaken: peelStatus.labelTaken,
+            labelsInQueue: labelsInQueue
+          });
+          
+          if (peelStatus.error) {
+            console.error(`Printer ${printer.name} peel sensor check failed: ${peelStatus.error}`);
+            await new Promise(resolve => setTimeout(resolve, printer.continuousPrint.pollInterval));
+            continue;
+          }
+          
+          // If label was taken (sensor is "clear"), replenish the queue
+          if (peelStatus.labelTaken && labelsInQueue > 0) {
+            // Label was taken - decrement queue and send a new one
+            labelsInQueue--;
+            console.log(`✓ Label taken from ${printer.name} (queue now: ${labelsInQueue})`);
+            
+            // Immediately send another label to maintain queue
+            if (labelsInQueue < TARGET_QUEUE_SIZE) {
+              console.log(`📄 Replenishing: printing label ${printer.continuousPrint.count + 1} to ${printer.name}`);
+              
+              await sendZPL(printer.ip, printer.continuousPrint.zpl);
+              printer.continuousPrint.count++;
+              labelsInQueue++;
+              printers[id].lastPrint = new Date().toISOString();
+              
+              console.log(`  → Queue replenished (queue size: ${labelsInQueue})`);
+            }
+          } else if (peelStatus.labelAtPeelPosition) {
+            // Label is waiting at peel position - just poll
+            // (No logging to reduce noise - this is the normal waiting state)
+          }
+          
+          // Poll again after interval
+          await new Promise(resolve => setTimeout(resolve, printer.continuousPrint.pollInterval));
+          
+        } catch (error) {
+          console.error(`Continuous print error for ${printer.name}:`, error.message);
+          printers[id].status = 'offline';
+          
+          // Don't stop on single error, keep trying
+          await new Promise(resolve => setTimeout(resolve, printer.continuousPrint.pollInterval * 2));
+        }
+      }
+      
+      console.log(`✓ Continuous printing stopped for ${printer.name}. Total labels: ${printer.continuousPrint.count}`);
+      savePrinters();
+    };
+    
+    // Start the loop in background
+    continuousPrintLoop();
+    
+    res.json({
+      success: true,
+      message: 'Continuous printing started (2-label queue: 1 presented + 1 buffered for instant presentation)',
+      printer: printer.name,
+      ip: printer.ip,
+      pollInterval: pollInterval,
+      queueSize: 2,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Stop continuous printing
+app.post('/api/printers/:id/print/continuous/stop', (req, res) => {
+  const { id } = req.params;
+  
+  try {
+    if (!printers[id]) {
+      return res.status(404).json({
+        success: false,
+        error: 'Printer not found'
+      });
+    }
+    
+    const printer = printers[id];
+    
+    if (!printer.continuousPrint || !printer.continuousPrint.active) {
+      return res.json({
+        success: true,
+        message: 'No active continuous print job',
+        printer: printer.name
+      });
+    }
+    
+    const count = printer.continuousPrint.count;
+    printer.continuousPrint.active = false;
+    savePrinters();
+    
+    res.json({
+      success: true,
+      message: 'Continuous printing stopped',
+      printer: printer.name,
+      labelsPrinted: count,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Get continuous print status
+app.get('/api/printers/:id/print/continuous/status', (req, res) => {
+  const { id } = req.params;
+  
+  try {
+    if (!printers[id]) {
+      return res.status(404).json({
+        success: false,
+        error: 'Printer not found'
+      });
+    }
+    
+    const printer = printers[id];
+    
+    if (!printer.continuousPrint) {
+      return res.json({
+        success: true,
+        active: false,
+        printer: printer.name
+      });
+    }
+    
+    res.json({
+      success: true,
+      active: printer.continuousPrint.active,
+      printer: printer.name,
+      labelsPrinted: printer.continuousPrint.count,
+      waitingForPeel: printer.continuousPrint.waitingForPeel,
+      pollInterval: printer.continuousPrint.pollInterval,
+      startedAt: printer.continuousPrint.startedAt,
+      queueStrategy: '2-label queue (1 presented + 1 in buffer)'
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Send ZPL print job (JSON)
+app.post('/api/printers/:id/print', async (req, res) => {
+  const { id } = req.params;
+  
+  try {
+    const { zpl } = req.body;
+    
+    if (!printers[id]) {
+      return res.status(404).json({
+        success: false,
+        error: 'Printer not found'
+      });
+    }
+    
+    if (!zpl) {
+      return res.status(400).json({
+        success: false,
+        error: 'ZPL data is required'
+      });
+    }
+    
+    const printer = printers[id];
+    
+    // Send to printer
+    await sendZPL(printer.ip, zpl);
+    
+    // Update last print time
+    printers[id].lastPrint = new Date().toISOString();
+    printers[id].status = 'online';
+    savePrinters();
+    
+    res.json({
+      success: true,
+      message: 'Print job sent successfully',
+      printer: printer.name,
+      ip: printer.ip,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    // Update printer status on error
+    if (printers[id]) {
+      printers[id].status = 'offline';
+      savePrinters();
+    }
+    
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Send raw ZPL print job (text/plain)
+app.post('/api/printers/:id/print/raw', async (req, res) => {
+  const { id } = req.params;
+  
+  try {
+    const zpl = req.body;
+    
+    if (!printers[id]) {
+      return res.status(404).json({
+        success: false,
+        error: 'Printer not found'
+      });
+    }
+    
+    if (!zpl) {
+      return res.status(400).json({
+        success: false,
+        error: 'ZPL data is required'
+      });
+    }
+    
+    const printer = printers[id];
+    
+    // Send to printer
+    await sendZPL(printer.ip, zpl);
+    
+    // Update last print time
+    printers[id].lastPrint = new Date().toISOString();
+    printers[id].status = 'online';
+    savePrinters();
+    
+    res.json({
+      success: true,
+      message: 'Print job sent successfully',
+      printer: printer.name,
+      ip: printer.ip,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    // Update printer status on error
+    if (printers[id]) {
+      printers[id].status = 'offline';
+      savePrinters();
+    }
+    
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Bulk print to multiple printers
+app.post('/api/printers/print/bulk', async (req, res) => {
+  try {
+    const { printerIds, zpl } = req.body;
+    
+    if (!printerIds || !Array.isArray(printerIds) || printerIds.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Array of printer IDs is required'
+      });
+    }
+    
+    if (!zpl) {
+      return res.status(400).json({
+        success: false,
+        error: 'ZPL data is required'
+      });
+    }
+    
+    const results = [];
+    
+    for (const id of printerIds) {
+      if (!printers[id]) {
+        results.push({
+          id,
+          success: false,
+          error: 'Printer not found'
+        });
+        continue;
+      }
+      
+      try {
+        await sendZPL(printers[id].ip, zpl);
+        printers[id].lastPrint = new Date().toISOString();
+        printers[id].status = 'online';
+        results.push({
+          id,
+          success: true,
+          printer: printers[id].name
+        });
+      } catch (error) {
+        printers[id].status = 'offline';
+        results.push({
+          id,
+          success: false,
+          error: error.message
+        });
+      }
+    }
+    
+    savePrinters();
+    
+    const successCount = results.filter(r => r.success).length;
+    
+    res.json({
+      success: true,
+      message: `Print jobs sent to ${successCount}/${printerIds.length} printers`,
+      results
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Load printers on startup
+loadPrinters();
+
+// ============================================
+// PRODUCT API ROUTES (SQL Server)
+// ============================================
+
+// List products with pagination and search
+app.get('/api/products', async (req, res) => {
+  try {
+    if (!isConfigured()) {
+      return res.status(503).json({
+        success: false,
+        error: 'Database not configured'
+      });
+    }
+
+    const { page = 1, limit = 50, search = '', inactive = 'false' } = req.query;
+    const offset = (parseInt(page) - 1) * parseInt(limit);
+    const pool = await getPool();
+
+    // Build query with conditions
+    let whereClause = '';
+    const conditions = [];
+
+    if (inactive === 'false') {
+      conditions.push('inactive = 0');
+    }
+
+    if (search) {
+      conditions.push(`(description LIKE @search OR gtin LIKE @search)`);
+    }
+
+    if (conditions.length > 0) {
+      whereClause = 'WHERE ' + conditions.join(' AND ');
+    }
+
+    // Get total count
+    const countResult = await pool.request()
+      .input('search', sql.NVarChar, `%${search}%`)
+      .query(`SELECT COUNT(*) as total FROM labeling_products ${whereClause}`);
+    const total = countResult.recordset[0].total;
+
+    // Get paginated data
+    const result = await pool.request()
+      .input('search', sql.NVarChar, `%${search}%`)
+      .input('offset', sql.Int, offset)
+      .input('limit', sql.Int, parseInt(limit))
+      .query(`
+        SELECT * FROM labeling_products
+        ${whereClause}
+        ORDER BY description
+        OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY
+      `);
+
+    res.json({
+      success: true,
+      products: result.recordset,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: total,
+        pages: Math.ceil(total / parseInt(limit))
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Search products (autocomplete)
+app.get('/api/products/search', async (req, res) => {
+  try {
+    if (!isConfigured()) {
+      return res.status(503).json({
+        success: false,
+        error: 'Database not configured'
+      });
+    }
+
+    const { q = '', limit = 20 } = req.query;
+
+    if (!q || q.length < 2) {
+      return res.json({
+        success: true,
+        products: []
+      });
+    }
+
+    const pool = await getPool();
+    const result = await pool.request()
+      .input('search', sql.NVarChar, `%${q}%`)
+      .input('limit', sql.Int, parseInt(limit))
+      .query(`
+        SELECT TOP (@limit) * FROM labeling_products
+        WHERE inactive = 0 AND (description LIKE @search OR gtin LIKE @search)
+        ORDER BY description
+      `);
+
+    res.json({
+      success: true,
+      products: result.recordset
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Get single product
+app.get('/api/products/:id', async (req, res) => {
+  try {
+    if (!isConfigured()) {
+      return res.status(503).json({
+        success: false,
+        error: 'Database not configured'
+      });
+    }
+
+    const { id } = req.params;
+    const pool = await getPool();
+
+    const result = await pool.request()
+      .input('id', sql.UniqueIdentifier, id)
+      .query('SELECT * FROM labeling_products WHERE id = @id');
+
+    if (result.recordset.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Product not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      product: result.recordset[0]
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// ============================================
+// TEMPLATE API ROUTES (SQL Server)
+// ============================================
+
+// List all templates
+app.get('/api/templates', async (req, res) => {
+  try {
+    if (!isConfigured()) {
+      return res.status(503).json({
+        success: false,
+        error: 'Database not configured'
+      });
+    }
+
+    const pool = await getPool();
+    const result = await pool.request()
+      .query('SELECT * FROM labeling_templates ORDER BY is_default DESC, name ASC');
+
+    // Parse elements JSON for each template
+    const templates = result.recordset.map(t => ({
+      ...t,
+      elements: typeof t.elements === 'string' ? JSON.parse(t.elements) : t.elements
+    }));
+
+    res.json({
+      success: true,
+      templates: templates
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Get single template
+app.get('/api/templates/:id', async (req, res) => {
+  try {
+    if (!isConfigured()) {
+      return res.status(503).json({
+        success: false,
+        error: 'Database not configured'
+      });
+    }
+
+    const { id } = req.params;
+    const pool = await getPool();
+
+    const result = await pool.request()
+      .input('id', sql.UniqueIdentifier, id)
+      .query('SELECT * FROM labeling_templates WHERE id = @id');
+
+    if (result.recordset.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Template not found'
+      });
+    }
+
+    const template = result.recordset[0];
+    template.elements = typeof template.elements === 'string' ? JSON.parse(template.elements) : template.elements;
+
+    res.json({
+      success: true,
+      template: template
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Create template
+app.post('/api/templates', async (req, res) => {
+  try {
+    if (!isConfigured()) {
+      return res.status(503).json({
+        success: false,
+        error: 'Database not configured'
+      });
+    }
+
+    const { name, description, elements, label_width, label_height, is_default } = req.body;
+
+    if (!name || !elements) {
+      return res.status(400).json({
+        success: false,
+        error: 'Name and elements are required'
+      });
+    }
+
+    const pool = await getPool();
+
+    // If setting as default, unset other defaults first
+    if (is_default) {
+      await pool.request().query('UPDATE labeling_templates SET is_default = 0 WHERE is_default = 1');
+    }
+
+    // Generate ID upfront to retrieve after insert (OUTPUT not allowed with triggers)
+    const newId = require('crypto').randomUUID();
+
+    await pool.request()
+      .input('id', sql.UniqueIdentifier, newId)
+      .input('name', sql.NVarChar, name)
+      .input('description', sql.NVarChar, description || '')
+      .input('elements', sql.NVarChar, JSON.stringify(elements))
+      .input('label_width', sql.Int, label_width || 812)
+      .input('label_height', sql.Int, label_height || 406)
+      .input('is_default', sql.Bit, is_default || false)
+      .query(`
+        INSERT INTO labeling_templates (id, name, description, elements, label_width, label_height, is_default)
+        VALUES (@id, @name, @description, @elements, @label_width, @label_height, @is_default)
+      `);
+
+    // Fetch the inserted row
+    const result = await pool.request()
+      .input('id', sql.UniqueIdentifier, newId)
+      .query('SELECT * FROM labeling_templates WHERE id = @id');
+
+    const template = result.recordset[0];
+    template.elements = typeof template.elements === 'string' ? JSON.parse(template.elements) : template.elements;
+
+    res.json({
+      success: true,
+      message: 'Template created successfully',
+      template: template
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Update template
+app.put('/api/templates/:id', async (req, res) => {
+  try {
+    if (!isConfigured()) {
+      return res.status(503).json({
+        success: false,
+        error: 'Database not configured'
+      });
+    }
+
+    const { id } = req.params;
+    const { name, description, elements, label_width, label_height, is_default } = req.body;
+
+    const pool = await getPool();
+
+    // If setting as default, unset other defaults first
+    if (is_default) {
+      await pool.request()
+        .input('id', sql.UniqueIdentifier, id)
+        .query('UPDATE labeling_templates SET is_default = 0 WHERE id != @id');
+    }
+
+    // Build dynamic update query
+    const updates = [];
+    const request = pool.request().input('id', sql.UniqueIdentifier, id);
+
+    if (name !== undefined) {
+      updates.push('name = @name');
+      request.input('name', sql.NVarChar, name);
+    }
+    if (description !== undefined) {
+      updates.push('description = @description');
+      request.input('description', sql.NVarChar, description);
+    }
+    if (elements !== undefined) {
+      updates.push('elements = @elements');
+      request.input('elements', sql.NVarChar, JSON.stringify(elements));
+    }
+    if (label_width !== undefined) {
+      updates.push('label_width = @label_width');
+      request.input('label_width', sql.Int, label_width);
+    }
+    if (label_height !== undefined) {
+      updates.push('label_height = @label_height');
+      request.input('label_height', sql.Int, label_height);
+    }
+    if (is_default !== undefined) {
+      updates.push('is_default = @is_default');
+      request.input('is_default', sql.Bit, is_default);
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'No fields to update'
+      });
+    }
+
+    // UPDATE without OUTPUT (triggers prevent OUTPUT clause)
+    const updateResult = await request.query(`
+      UPDATE labeling_templates SET ${updates.join(', ')}
+      WHERE id = @id
+    `);
+
+    if (updateResult.rowsAffected[0] === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Template not found'
+      });
+    }
+
+    // Fetch the updated row
+    const result = await pool.request()
+      .input('id', sql.UniqueIdentifier, id)
+      .query('SELECT * FROM labeling_templates WHERE id = @id');
+
+    const template = result.recordset[0];
+    template.elements = typeof template.elements === 'string' ? JSON.parse(template.elements) : template.elements;
+
+    res.json({
+      success: true,
+      message: 'Template updated successfully',
+      template: template
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Delete template
+app.delete('/api/templates/:id', async (req, res) => {
+  try {
+    if (!isConfigured()) {
+      return res.status(503).json({
+        success: false,
+        error: 'Database not configured'
+      });
+    }
+
+    const { id } = req.params;
+    const pool = await getPool();
+
+    await pool.request()
+      .input('id', sql.UniqueIdentifier, id)
+      .query('DELETE FROM labeling_templates WHERE id = @id');
+
+    res.json({
+      success: true,
+      message: 'Template deleted successfully'
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// ============================================
+// VARIABLES API ROUTES (SQL Server)
+// ============================================
+
+// Get all variables for a template
+app.get('/api/templates/:templateId/variables', async (req, res) => {
+  try {
+    if (!isConfigured()) {
+      return res.status(503).json({
+        success: false,
+        error: 'Database not configured'
+      });
+    }
+
+    const { templateId } = req.params;
+    const pool = await getPool();
+
+    const result = await pool.request()
+      .input('templateId', sql.UniqueIdentifier, templateId)
+      .query('SELECT * FROM labeling_variables WHERE template_id = @templateId ORDER BY sort_order, created_at');
+
+    // Parse options JSON for each variable
+    const variables = result.recordset.map(v => ({
+      ...v,
+      options: v.options ? (typeof v.options === 'string' ? JSON.parse(v.options) : v.options) : null
+    }));
+
+    res.json({
+      success: true,
+      variables: variables
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Create variable for a template
+app.post('/api/templates/:templateId/variables', async (req, res) => {
+  try {
+    if (!isConfigured()) {
+      return res.status(503).json({
+        success: false,
+        error: 'Database not configured'
+      });
+    }
+
+    const { templateId } = req.params;
+    const { key, label, default_value, field_type, options, required, sort_order } = req.body;
+
+    if (!key || !label) {
+      return res.status(400).json({
+        success: false,
+        error: 'Key and label are required'
+      });
+    }
+
+    const pool = await getPool();
+    const newId = require('crypto').randomUUID();
+
+    await pool.request()
+      .input('id', sql.UniqueIdentifier, newId)
+      .input('template_id', sql.UniqueIdentifier, templateId)
+      .input('key', sql.VarChar, key)
+      .input('label', sql.NVarChar, label)
+      .input('default_value', sql.NVarChar, default_value || '')
+      .input('field_type', sql.VarChar, field_type || 'text')
+      .input('options', sql.NVarChar, options ? JSON.stringify(options) : null)
+      .input('required', sql.Bit, required || false)
+      .input('sort_order', sql.Int, sort_order || 0)
+      .query(`
+        INSERT INTO labeling_variables (id, template_id, [key], label, default_value, field_type, options, required, sort_order)
+        VALUES (@id, @template_id, @key, @label, @default_value, @field_type, @options, @required, @sort_order)
+      `);
+
+    // Fetch the inserted row
+    const result = await pool.request()
+      .input('id', sql.UniqueIdentifier, newId)
+      .query('SELECT * FROM labeling_variables WHERE id = @id');
+
+    const variable = result.recordset[0];
+    if (variable.options) {
+      variable.options = typeof variable.options === 'string' ? JSON.parse(variable.options) : variable.options;
+    }
+
+    res.json({
+      success: true,
+      message: 'Variable created successfully',
+      variable: variable
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Update variable
+app.put('/api/variables/:id', async (req, res) => {
+  try {
+    if (!isConfigured()) {
+      return res.status(503).json({
+        success: false,
+        error: 'Database not configured'
+      });
+    }
+
+    const { id } = req.params;
+    const { key, label, default_value, field_type, options, required, sort_order } = req.body;
+
+    const pool = await getPool();
+    const updates = [];
+    const request = pool.request().input('id', sql.UniqueIdentifier, id);
+
+    if (key !== undefined) {
+      updates.push('[key] = @key');
+      request.input('key', sql.VarChar, key);
+    }
+    if (label !== undefined) {
+      updates.push('label = @label');
+      request.input('label', sql.NVarChar, label);
+    }
+    if (default_value !== undefined) {
+      updates.push('default_value = @default_value');
+      request.input('default_value', sql.NVarChar, default_value);
+    }
+    if (field_type !== undefined) {
+      updates.push('field_type = @field_type');
+      request.input('field_type', sql.VarChar, field_type);
+    }
+    if (options !== undefined) {
+      updates.push('options = @options');
+      request.input('options', sql.NVarChar, options ? JSON.stringify(options) : null);
+    }
+    if (required !== undefined) {
+      updates.push('required = @required');
+      request.input('required', sql.Bit, required);
+    }
+    if (sort_order !== undefined) {
+      updates.push('sort_order = @sort_order');
+      request.input('sort_order', sql.Int, sort_order);
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'No fields to update'
+      });
+    }
+
+    // UPDATE without OUTPUT (triggers prevent OUTPUT clause)
+    const updateResult = await request.query(`
+      UPDATE labeling_variables SET ${updates.join(', ')}
+      WHERE id = @id
+    `);
+
+    if (updateResult.rowsAffected[0] === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Variable not found'
+      });
+    }
+
+    // Fetch the updated row
+    const result = await pool.request()
+      .input('id', sql.UniqueIdentifier, id)
+      .query('SELECT * FROM labeling_variables WHERE id = @id');
+
+    const variable = result.recordset[0];
+    if (variable.options) {
+      variable.options = typeof variable.options === 'string' ? JSON.parse(variable.options) : variable.options;
+    }
+
+    res.json({
+      success: true,
+      message: 'Variable updated successfully',
+      variable: variable
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Delete variable
+app.delete('/api/variables/:id', async (req, res) => {
+  try {
+    if (!isConfigured()) {
+      return res.status(503).json({
+        success: false,
+        error: 'Database not configured'
+      });
+    }
+
+    const { id } = req.params;
+    const pool = await getPool();
+
+    await pool.request()
+      .input('id', sql.UniqueIdentifier, id)
+      .query('DELETE FROM labeling_variables WHERE id = @id');
+
+    res.json({
+      success: true,
+      message: 'Variable deleted successfully'
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Bulk upsert variables for a template (replaces all variables)
+app.put('/api/templates/:templateId/variables', async (req, res) => {
+  try {
+    if (!isConfigured()) {
+      return res.status(503).json({
+        success: false,
+        error: 'Database not configured'
+      });
+    }
+
+    const { templateId } = req.params;
+    const { variables } = req.body;
+
+    if (!Array.isArray(variables)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Variables must be an array'
+      });
+    }
+
+    const pool = await getPool();
+
+    // Delete existing variables for this template
+    await pool.request()
+      .input('templateId', sql.UniqueIdentifier, templateId)
+      .query('DELETE FROM labeling_variables WHERE template_id = @templateId');
+
+    // Insert new variables
+    if (variables.length > 0) {
+      for (let i = 0; i < variables.length; i++) {
+        const v = variables[i];
+        await pool.request()
+          .input('template_id', sql.UniqueIdentifier, templateId)
+          .input('key', sql.VarChar, v.key)
+          .input('label', sql.NVarChar, v.label)
+          .input('default_value', sql.NVarChar, v.default_value || v.defaultValue || '')
+          .input('field_type', sql.VarChar, v.field_type || v.fieldType || 'text')
+          .input('options', sql.NVarChar, v.options ? JSON.stringify(v.options) : null)
+          .input('required', sql.Bit, v.required || false)
+          .input('sort_order', sql.Int, v.sort_order ?? i)
+          .query(`
+            INSERT INTO labeling_variables (template_id, [key], label, default_value, field_type, options, required, sort_order)
+            VALUES (@template_id, @key, @label, @default_value, @field_type, @options, @required, @sort_order)
+          `);
+      }
+    }
+
+    // Fetch the updated variables
+    const result = await pool.request()
+      .input('templateId', sql.UniqueIdentifier, templateId)
+      .query('SELECT * FROM labeling_variables WHERE template_id = @templateId ORDER BY sort_order');
+
+    const returnedVars = result.recordset.map(v => ({
+      ...v,
+      options: v.options ? (typeof v.options === 'string' ? JSON.parse(v.options) : v.options) : null
+    }));
+
+    res.json({
+      success: true,
+      message: 'Variables updated successfully',
+      variables: returnedVars
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// ============================================
+// PRINTER CONFIG API ROUTES (SQL Server)
+// ============================================
+
+// Get printer config
+app.get('/api/printer-configs/:printerId', async (req, res) => {
+  try {
+    if (!isConfigured()) {
+      return res.status(503).json({
+        success: false,
+        error: 'Database not configured'
+      });
+    }
+
+    const { printerId } = req.params;
+    const pool = await getPool();
+
+    const result = await pool.request()
+      .input('printerId', sql.VarChar, printerId)
+      .query(`
+        SELECT
+          pc.*,
+          t.id as template_id, t.name as template_name, t.description as template_description,
+          t.elements as template_elements, t.label_width as template_label_width,
+          t.label_height as template_label_height, t.is_default as template_is_default,
+          p.id as product_id, p.description as product_description, p.gtin as product_gtin,
+          p.company_name as product_company_name, p.company_prefix as product_company_prefix,
+          p.item_reference as product_item_reference, p.indicator_digit as product_indicator_digit,
+          p.external_upc as product_external_upc, p.external_plu as product_external_plu
+        FROM labeling_printer_configs pc
+        LEFT JOIN labeling_templates t ON pc.template_id = t.id
+        LEFT JOIN labeling_products p ON pc.product_id = p.id
+        WHERE pc.printer_id = @printerId
+      `);
+
+    if (result.recordset.length === 0) {
+      return res.json({
+        success: true,
+        config: null
+      });
+    }
+
+    const row = result.recordset[0];
+
+    // Build nested config object
+    const config = {
+      id: row.id,
+      printer_id: row.printer_id,
+      template_id: row.template_id,
+      product_id: row.product_id,
+      lot_number: row.lot_number,
+      pack_date: row.pack_date,
+      variable_values: row.variable_values ? (typeof row.variable_values === 'string' ? JSON.parse(row.variable_values) : row.variable_values) : {},
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+      template: row.template_id ? {
+        id: row.template_id,
+        name: row.template_name,
+        description: row.template_description,
+        elements: row.template_elements ? (typeof row.template_elements === 'string' ? JSON.parse(row.template_elements) : row.template_elements) : [],
+        label_width: row.template_label_width,
+        label_height: row.template_label_height,
+        is_default: row.template_is_default
+      } : null,
+      product: row.product_id ? {
+        id: row.product_id,
+        description: row.product_description,
+        gtin: row.product_gtin,
+        company_name: row.product_company_name,
+        company_prefix: row.product_company_prefix,
+        item_reference: row.product_item_reference,
+        indicator_digit: row.product_indicator_digit,
+        external_upc: row.product_external_upc,
+        external_plu: row.product_external_plu
+      } : null
+    };
+
+    res.json({
+      success: true,
+      config: config
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Get all printer configs
+app.get('/api/printer-configs', async (req, res) => {
+  try {
+    if (!isConfigured()) {
+      return res.status(503).json({
+        success: false,
+        error: 'Database not configured'
+      });
+    }
+
+    const pool = await getPool();
+    const result = await pool.request()
+      .query(`
+        SELECT
+          pc.*,
+          t.id as template_id, t.name as template_name, t.description as template_description,
+          t.elements as template_elements, t.label_width as template_label_width,
+          t.label_height as template_label_height, t.is_default as template_is_default,
+          p.id as product_id, p.description as product_description, p.gtin as product_gtin,
+          p.company_name as product_company_name, p.company_prefix as product_company_prefix,
+          p.item_reference as product_item_reference, p.indicator_digit as product_indicator_digit
+        FROM labeling_printer_configs pc
+        LEFT JOIN labeling_templates t ON pc.template_id = t.id
+        LEFT JOIN labeling_products p ON pc.product_id = p.id
+      `);
+
+    const configs = result.recordset.map(row => ({
+      id: row.id,
+      printer_id: row.printer_id,
+      template_id: row.template_id,
+      product_id: row.product_id,
+      lot_number: row.lot_number,
+      pack_date: row.pack_date,
+      variable_values: row.variable_values ? (typeof row.variable_values === 'string' ? JSON.parse(row.variable_values) : row.variable_values) : {},
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+      template: row.template_id ? {
+        id: row.template_id,
+        name: row.template_name,
+        description: row.template_description,
+        elements: row.template_elements ? (typeof row.template_elements === 'string' ? JSON.parse(row.template_elements) : row.template_elements) : [],
+        label_width: row.template_label_width,
+        label_height: row.template_label_height,
+        is_default: row.template_is_default
+      } : null,
+      product: row.product_id ? {
+        id: row.product_id,
+        description: row.product_description,
+        gtin: row.product_gtin,
+        company_name: row.product_company_name,
+        company_prefix: row.product_company_prefix,
+        item_reference: row.product_item_reference,
+        indicator_digit: row.product_indicator_digit
+      } : null
+    }));
+
+    res.json({
+      success: true,
+      configs: configs
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Save/update printer config (upsert)
+app.put('/api/printer-configs/:printerId', async (req, res) => {
+  try {
+    if (!isConfigured()) {
+      return res.status(503).json({
+        success: false,
+        error: 'Database not configured'
+      });
+    }
+
+    const { printerId } = req.params;
+    const { template_id, product_id, lot_number, pack_date, variable_values } = req.body;
+
+    const pool = await getPool();
+
+    // Check if config exists
+    const existsResult = await pool.request()
+      .input('printerId', sql.VarChar, printerId)
+      .query('SELECT id FROM labeling_printer_configs WHERE printer_id = @printerId');
+
+    if (existsResult.recordset.length > 0) {
+      // Update existing
+      await pool.request()
+        .input('printerId', sql.VarChar, printerId)
+        .input('template_id', sql.UniqueIdentifier, template_id || null)
+        .input('product_id', sql.UniqueIdentifier, product_id || null)
+        .input('lot_number', sql.VarChar, lot_number || '')
+        .input('pack_date', sql.VarChar, pack_date || '')
+        .input('variable_values', sql.NVarChar, JSON.stringify(variable_values || {}))
+        .query(`
+          UPDATE labeling_printer_configs
+          SET template_id = @template_id, product_id = @product_id,
+              lot_number = @lot_number, pack_date = @pack_date, variable_values = @variable_values
+          WHERE printer_id = @printerId
+        `);
+    } else {
+      // Insert new
+      await pool.request()
+        .input('printerId', sql.VarChar, printerId)
+        .input('template_id', sql.UniqueIdentifier, template_id || null)
+        .input('product_id', sql.UniqueIdentifier, product_id || null)
+        .input('lot_number', sql.VarChar, lot_number || '')
+        .input('pack_date', sql.VarChar, pack_date || '')
+        .input('variable_values', sql.NVarChar, JSON.stringify(variable_values || {}))
+        .query(`
+          INSERT INTO labeling_printer_configs (printer_id, template_id, product_id, lot_number, pack_date, variable_values)
+          VALUES (@printerId, @template_id, @product_id, @lot_number, @pack_date, @variable_values)
+        `);
+    }
+
+    // Fetch the updated config with joins
+    const result = await pool.request()
+      .input('printerId', sql.VarChar, printerId)
+      .query(`
+        SELECT
+          pc.*,
+          t.id as template_id, t.name as template_name, t.description as template_description,
+          t.elements as template_elements, t.label_width as template_label_width,
+          t.label_height as template_label_height, t.is_default as template_is_default,
+          p.id as product_id, p.description as product_description, p.gtin as product_gtin,
+          p.company_name as product_company_name, p.company_prefix as product_company_prefix,
+          p.item_reference as product_item_reference, p.indicator_digit as product_indicator_digit
+        FROM labeling_printer_configs pc
+        LEFT JOIN labeling_templates t ON pc.template_id = t.id
+        LEFT JOIN labeling_products p ON pc.product_id = p.id
+        WHERE pc.printer_id = @printerId
+      `);
+
+    const row = result.recordset[0];
+    const config = {
+      id: row.id,
+      printer_id: row.printer_id,
+      template_id: row.template_id,
+      product_id: row.product_id,
+      lot_number: row.lot_number,
+      pack_date: row.pack_date,
+      variable_values: row.variable_values ? (typeof row.variable_values === 'string' ? JSON.parse(row.variable_values) : row.variable_values) : {},
+      template: row.template_id ? {
+        id: row.template_id,
+        name: row.template_name,
+        description: row.template_description,
+        elements: row.template_elements ? (typeof row.template_elements === 'string' ? JSON.parse(row.template_elements) : row.template_elements) : [],
+        label_width: row.template_label_width,
+        label_height: row.template_label_height,
+        is_default: row.template_is_default
+      } : null,
+      product: row.product_id ? {
+        id: row.product_id,
+        description: row.product_description,
+        gtin: row.product_gtin,
+        company_name: row.product_company_name,
+        company_prefix: row.product_company_prefix,
+        item_reference: row.product_item_reference,
+        indicator_digit: row.product_indicator_digit
+      } : null
+    };
+
+    res.json({
+      success: true,
+      message: 'Printer config saved successfully',
+      config: config
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Clear printer config
+app.delete('/api/printer-configs/:printerId', async (req, res) => {
+  try {
+    if (!isConfigured()) {
+      return res.status(503).json({
+        success: false,
+        error: 'Database not configured'
+      });
+    }
+
+    const { printerId } = req.params;
+    const pool = await getPool();
+
+    await pool.request()
+      .input('printerId', sql.VarChar, printerId)
+      .query('DELETE FROM labeling_printer_configs WHERE printer_id = @printerId');
+
+    res.json({
+      success: true,
+      message: 'Printer config cleared successfully'
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// ============================================
+// SCANNER API ROUTES (SQL Server)
+// ============================================
+
+// List all scanners
+app.get('/api/scanners', async (req, res) => {
+  try {
+    if (!isConfigured()) {
+      return res.status(503).json({ success: false, error: 'Database not configured' });
+    }
+
+    const pool = await getPool();
+    const result = await pool.request()
+      .query('SELECT * FROM labeling_scanners ORDER BY name ASC');
+
+    res.json({ success: true, scanners: result.recordset });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Get single scanner with locations
+app.get('/api/scanners/:id', async (req, res) => {
+  try {
+    if (!isConfigured()) {
+      return res.status(503).json({ success: false, error: 'Database not configured' });
+    }
+
+    const { id } = req.params;
+    const pool = await getPool();
+
+    const scannerResult = await pool.request()
+      .input('id', sql.UniqueIdentifier, id)
+      .query('SELECT * FROM labeling_scanners WHERE id = @id');
+
+    if (scannerResult.recordset.length === 0) {
+      return res.status(404).json({ success: false, error: 'Scanner not found' });
+    }
+
+    const locationsResult = await pool.request()
+      .input('scannerId', sql.UniqueIdentifier, id)
+      .query('SELECT * FROM labeling_scan_locations WHERE scanner_id = @scannerId ORDER BY location_number ASC');
+
+    res.json({
+      success: true,
+      scanner: {
+        ...scannerResult.recordset[0],
+        locations: locationsResult.recordset
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Create scanner
+app.post('/api/scanners', async (req, res) => {
+  try {
+    if (!isConfigured()) {
+      return res.status(503).json({ success: false, error: 'Database not configured' });
+    }
+
+    const { name, description, connection_type, connection_string, enabled } = req.body;
+    const newId = require('crypto').randomUUID();
+    const pool = await getPool();
+
+    await pool.request()
+      .input('id', sql.UniqueIdentifier, newId)
+      .input('name', sql.NVarChar, name)
+      .input('description', sql.NVarChar, description || null)
+      .input('connection_type', sql.VarChar, connection_type || 'serial')
+      .input('connection_string', sql.NVarChar, connection_string || null)
+      .input('enabled', sql.Bit, enabled !== false)
+      .query(`INSERT INTO labeling_scanners (id, name, description, connection_type, connection_string, enabled)
+              VALUES (@id, @name, @description, @connection_type, @connection_string, @enabled)`);
+
+    const result = await pool.request()
+      .input('id', sql.UniqueIdentifier, newId)
+      .query('SELECT * FROM labeling_scanners WHERE id = @id');
+
+    res.status(201).json({ success: true, scanner: result.recordset[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Update scanner
+app.put('/api/scanners/:id', async (req, res) => {
+  try {
+    if (!isConfigured()) {
+      return res.status(503).json({ success: false, error: 'Database not configured' });
+    }
+
+    const { id } = req.params;
+    const { name, description, connection_type, connection_string, enabled } = req.body;
+    const pool = await getPool();
+
+    await pool.request()
+      .input('id', sql.UniqueIdentifier, id)
+      .input('name', sql.NVarChar, name)
+      .input('description', sql.NVarChar, description || null)
+      .input('connection_type', sql.VarChar, connection_type || 'serial')
+      .input('connection_string', sql.NVarChar, connection_string || null)
+      .input('enabled', sql.Bit, enabled !== false)
+      .query(`UPDATE labeling_scanners SET name = @name, description = @description,
+              connection_type = @connection_type, connection_string = @connection_string,
+              enabled = @enabled WHERE id = @id`);
+
+    const result = await pool.request()
+      .input('id', sql.UniqueIdentifier, id)
+      .query('SELECT * FROM labeling_scanners WHERE id = @id');
+
+    res.json({ success: true, scanner: result.recordset[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Delete scanner
+app.delete('/api/scanners/:id', async (req, res) => {
+  try {
+    if (!isConfigured()) {
+      return res.status(503).json({ success: false, error: 'Database not configured' });
+    }
+
+    const { id } = req.params;
+    const pool = await getPool();
+
+    await pool.request()
+      .input('id', sql.UniqueIdentifier, id)
+      .query('DELETE FROM labeling_scanners WHERE id = @id');
+
+    res.json({ success: true, message: 'Scanner deleted' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================
+// SCAN LOCATION API ROUTES
+// ============================================
+
+// List locations for a scanner
+app.get('/api/scanners/:scannerId/locations', async (req, res) => {
+  try {
+    if (!isConfigured()) {
+      return res.status(503).json({ success: false, error: 'Database not configured' });
+    }
+
+    const { scannerId } = req.params;
+    const pool = await getPool();
+
+    const result = await pool.request()
+      .input('scannerId', sql.UniqueIdentifier, scannerId)
+      .query('SELECT * FROM labeling_scan_locations WHERE scanner_id = @scannerId ORDER BY location_number ASC');
+
+    res.json({ success: true, locations: result.recordset });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Create location
+app.post('/api/scanners/:scannerId/locations', async (req, res) => {
+  try {
+    if (!isConfigured()) {
+      return res.status(503).json({ success: false, error: 'Database not configured' });
+    }
+
+    const { scannerId } = req.params;
+    const { location_number, name, printer_id, enabled } = req.body;
+    const newId = require('crypto').randomUUID();
+    const pool = await getPool();
+
+    await pool.request()
+      .input('id', sql.UniqueIdentifier, newId)
+      .input('scanner_id', sql.UniqueIdentifier, scannerId)
+      .input('location_number', sql.Int, location_number)
+      .input('name', sql.NVarChar, name)
+      .input('printer_id', sql.VarChar, printer_id || null)
+      .input('enabled', sql.Bit, enabled !== false)
+      .query(`INSERT INTO labeling_scan_locations (id, scanner_id, location_number, name, printer_id, enabled)
+              VALUES (@id, @scanner_id, @location_number, @name, @printer_id, @enabled)`);
+
+    const result = await pool.request()
+      .input('id', sql.UniqueIdentifier, newId)
+      .query('SELECT * FROM labeling_scan_locations WHERE id = @id');
+
+    res.status(201).json({ success: true, location: result.recordset[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Update location
+app.put('/api/locations/:id', async (req, res) => {
+  try {
+    if (!isConfigured()) {
+      return res.status(503).json({ success: false, error: 'Database not configured' });
+    }
+
+    const { id } = req.params;
+    const { name, printer_id, enabled } = req.body;
+    const pool = await getPool();
+
+    await pool.request()
+      .input('id', sql.UniqueIdentifier, id)
+      .input('name', sql.NVarChar, name)
+      .input('printer_id', sql.VarChar, printer_id || null)
+      .input('enabled', sql.Bit, enabled !== false)
+      .query(`UPDATE labeling_scan_locations SET name = @name, printer_id = @printer_id,
+              enabled = @enabled WHERE id = @id`);
+
+    const result = await pool.request()
+      .input('id', sql.UniqueIdentifier, id)
+      .query('SELECT * FROM labeling_scan_locations WHERE id = @id');
+
+    res.json({ success: true, location: result.recordset[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Delete location
+app.delete('/api/locations/:id', async (req, res) => {
+  try {
+    if (!isConfigured()) {
+      return res.status(503).json({ success: false, error: 'Database not configured' });
+    }
+
+    const { id } = req.params;
+    const pool = await getPool();
+
+    await pool.request()
+      .input('id', sql.UniqueIdentifier, id)
+      .query('DELETE FROM labeling_scan_locations WHERE id = @id');
+
+    res.json({ success: true, message: 'Location deleted' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================
+// LICENSE PLATE CONFIG API ROUTES
+// ============================================
+
+// Get configs for a license plate code
+app.get('/api/license-plates/:code/configs', async (req, res) => {
+  try {
+    if (!isConfigured()) {
+      return res.status(503).json({ success: false, error: 'Database not configured' });
+    }
+
+    const { code } = req.params;
+    const pool = await getPool();
+
+    const result = await pool.request()
+      .input('code', sql.VarChar, code)
+      .query(`SELECT lpc.*, sl.name as location_name, sl.location_number, sl.printer_id,
+              s.name as scanner_name, t.name as template_name, p.description as product_description
+              FROM labeling_license_plate_configs lpc
+              JOIN labeling_scan_locations sl ON lpc.location_id = sl.id
+              JOIN labeling_scanners s ON sl.scanner_id = s.id
+              LEFT JOIN labeling_templates t ON lpc.template_id = t.id
+              LEFT JOIN labeling_products p ON lpc.product_id = p.id
+              WHERE lpc.license_plate_code = @code
+              ORDER BY s.name, sl.location_number`);
+
+    res.json({ success: true, configs: result.recordset });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Get configs for a specific location
+app.get('/api/locations/:locationId/configs', async (req, res) => {
+  try {
+    if (!isConfigured()) {
+      return res.status(503).json({ success: false, error: 'Database not configured' });
+    }
+
+    const { locationId } = req.params;
+    const pool = await getPool();
+
+    const result = await pool.request()
+      .input('locationId', sql.UniqueIdentifier, locationId)
+      .query(`SELECT lpc.*, t.name as template_name, p.description as product_description, p.gtin, p.company_name
+              FROM labeling_license_plate_configs lpc
+              LEFT JOIN labeling_templates t ON lpc.template_id = t.id
+              LEFT JOIN labeling_products p ON lpc.product_id = p.id
+              WHERE lpc.location_id = @locationId
+              ORDER BY lpc.license_plate_code`);
+
+    // Parse variable_values JSON for each config
+    const configs = result.recordset.map(config => ({
+      ...config,
+      variable_values: config.variable_values ? JSON.parse(config.variable_values) : {}
+    }));
+
+    res.json({ success: true, configs });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Create/update license plate config
+app.post('/api/license-plate-configs', async (req, res) => {
+  try {
+    if (!isConfigured()) {
+      return res.status(503).json({ success: false, error: 'Database not configured' });
+    }
+
+    const { license_plate_code, location_id, template_id, product_id, copies, enabled, lot_number, pack_date, variable_values } = req.body;
+    const pool = await getPool();
+    const variableValuesJson = JSON.stringify(variable_values || {});
+
+    // Check if config already exists
+    const existing = await pool.request()
+      .input('code', sql.VarChar, license_plate_code)
+      .input('locationId', sql.UniqueIdentifier, location_id)
+      .query(`SELECT id FROM labeling_license_plate_configs
+              WHERE license_plate_code = @code AND location_id = @locationId`);
+
+    if (existing.recordset.length > 0) {
+      // Update existing
+      const existingId = existing.recordset[0].id;
+      await pool.request()
+        .input('id', sql.UniqueIdentifier, existingId)
+        .input('template_id', sql.UniqueIdentifier, template_id || null)
+        .input('product_id', sql.UniqueIdentifier, product_id || null)
+        .input('copies', sql.Int, copies || 1)
+        .input('lot_number', sql.VarChar, lot_number || '')
+        .input('pack_date', sql.VarChar, pack_date || '')
+        .input('variable_values', sql.NVarChar, variableValuesJson)
+        .input('enabled', sql.Bit, enabled !== false)
+        .query(`UPDATE labeling_license_plate_configs
+                SET template_id = @template_id, product_id = @product_id, copies = @copies,
+                    lot_number = @lot_number, pack_date = @pack_date, variable_values = @variable_values, enabled = @enabled
+                WHERE id = @id`);
+
+      const result = await pool.request()
+        .input('id', sql.UniqueIdentifier, existingId)
+        .query('SELECT * FROM labeling_license_plate_configs WHERE id = @id');
+
+      res.json({ success: true, config: result.recordset[0], updated: true });
+    } else {
+      // Create new
+      const newId = require('crypto').randomUUID();
+      await pool.request()
+        .input('id', sql.UniqueIdentifier, newId)
+        .input('license_plate_code', sql.VarChar, license_plate_code)
+        .input('location_id', sql.UniqueIdentifier, location_id)
+        .input('template_id', sql.UniqueIdentifier, template_id || null)
+        .input('product_id', sql.UniqueIdentifier, product_id || null)
+        .input('copies', sql.Int, copies || 1)
+        .input('lot_number', sql.VarChar, lot_number || '')
+        .input('pack_date', sql.VarChar, pack_date || '')
+        .input('variable_values', sql.NVarChar, variableValuesJson)
+        .input('enabled', sql.Bit, enabled !== false)
+        .query(`INSERT INTO labeling_license_plate_configs
+                (id, license_plate_code, location_id, template_id, product_id, copies, lot_number, pack_date, variable_values, enabled)
+                VALUES (@id, @license_plate_code, @location_id, @template_id, @product_id, @copies, @lot_number, @pack_date, @variable_values, @enabled)`);
+
+      const result = await pool.request()
+        .input('id', sql.UniqueIdentifier, newId)
+        .query('SELECT * FROM labeling_license_plate_configs WHERE id = @id');
+
+      res.status(201).json({ success: true, config: result.recordset[0], created: true });
+    }
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Delete license plate config
+app.delete('/api/license-plate-configs/:id', async (req, res) => {
+  try {
+    if (!isConfigured()) {
+      return res.status(503).json({ success: false, error: 'Database not configured' });
+    }
+
+    const { id } = req.params;
+    const pool = await getPool();
+
+    await pool.request()
+      .input('id', sql.UniqueIdentifier, id)
+      .query('DELETE FROM labeling_license_plate_configs WHERE id = @id');
+
+    res.json({ success: true, message: 'Config deleted' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================
+// SCAN EVENT HANDLER - Main entry point for scanners
+// ============================================
+
+// Handle incoming scan event - triggers label printing
+app.post('/api/scan', async (req, res) => {
+  try {
+    if (!isConfigured()) {
+      return res.status(503).json({ success: false, error: 'Database not configured' });
+    }
+
+    const { scanner_id, license_plate_code } = req.body;
+
+    if (!scanner_id || !license_plate_code) {
+      return res.status(400).json({
+        success: false,
+        error: 'scanner_id and license_plate_code are required'
+      });
+    }
+
+    const pool = await getPool();
+    const eventId = require('crypto').randomUUID();
+
+    // Get all configured locations and their print configs for this scanner + code
+    const configsResult = await pool.request()
+      .input('scannerId', sql.UniqueIdentifier, scanner_id)
+      .input('code', sql.VarChar, license_plate_code)
+      .query(`SELECT lpc.*, sl.printer_id, sl.name as location_name, sl.location_number,
+              t.elements, t.label_width, t.label_height, t.name as template_name,
+              p.gtin, p.description as product_description, p.company_name, p.company_prefix,
+              p.item_reference, p.indicator_digit
+              FROM labeling_license_plate_configs lpc
+              JOIN labeling_scan_locations sl ON lpc.location_id = sl.id
+              LEFT JOIN labeling_templates t ON lpc.template_id = t.id
+              LEFT JOIN labeling_products p ON lpc.product_id = p.id
+              WHERE sl.scanner_id = @scannerId
+              AND lpc.license_plate_code = @code
+              AND lpc.enabled = 1
+              AND sl.enabled = 1
+              ORDER BY sl.location_number`);
+
+    const configs = configsResult.recordset;
+
+    if (configs.length === 0) {
+      // Log event as no_config
+      await pool.request()
+        .input('id', sql.UniqueIdentifier, eventId)
+        .input('scanner_id', sql.UniqueIdentifier, scanner_id)
+        .input('license_plate_code', sql.VarChar, license_plate_code)
+        .input('status', sql.VarChar, 'no_config')
+        .query(`INSERT INTO labeling_scan_events (id, scanner_id, license_plate_code, status)
+                VALUES (@id, @scanner_id, @license_plate_code, @status)`);
+
+      return res.json({
+        success: true,
+        message: 'No print configurations found for this code',
+        labels_printed: 0,
+        event_id: eventId
+      });
+    }
+
+    // Process each configured location
+    const printResults = [];
+    let totalPrinted = 0;
+    let hasErrors = false;
+
+    for (const config of configs) {
+      if (!config.printer_id || !config.elements) {
+        printResults.push({
+          location: config.location_name,
+          location_number: config.location_number,
+          status: 'skipped',
+          reason: !config.printer_id ? 'No printer assigned' : 'No template configured'
+        });
+        continue;
+      }
+
+      try {
+        // Parse template elements
+        const elements = typeof config.elements === 'string'
+          ? JSON.parse(config.elements)
+          : config.elements;
+
+        // Substitute product variables in elements
+        const processedElements = elements.map(el => {
+          const processed = { ...el };
+          if (processed.text) {
+            processed.text = substituteProductVars(processed.text, config);
+          }
+          if (processed.data) {
+            processed.data = substituteProductVars(processed.data, config);
+          }
+          return processed;
+        });
+
+        // Generate ZPL
+        const zpl = generateZPLFromElements(processedElements, config.label_width, config.label_height);
+
+        // Get printer info
+        const printer = printers[config.printer_id];
+        if (!printer) {
+          printResults.push({
+            location: config.location_name,
+            location_number: config.location_number,
+            status: 'error',
+            reason: `Printer ${config.printer_id} not found`
+          });
+          hasErrors = true;
+          continue;
+        }
+
+        // Print the label (multiple copies if configured)
+        for (let i = 0; i < (config.copies || 1); i++) {
+          await sendToPrinter(printer, zpl);
+          totalPrinted++;
+        }
+
+        printResults.push({
+          location: config.location_name,
+          location_number: config.location_number,
+          printer: config.printer_id,
+          copies: config.copies || 1,
+          status: 'success'
+        });
+      } catch (printError) {
+        printResults.push({
+          location: config.location_name,
+          location_number: config.location_number,
+          status: 'error',
+          reason: printError.message
+        });
+        hasErrors = true;
+      }
+    }
+
+    // Log the scan event
+    await pool.request()
+      .input('id', sql.UniqueIdentifier, eventId)
+      .input('scanner_id', sql.UniqueIdentifier, scanner_id)
+      .input('license_plate_code', sql.VarChar, license_plate_code)
+      .input('labels_printed', sql.Int, totalPrinted)
+      .input('status', sql.VarChar, hasErrors ? 'partial' : 'success')
+      .query(`INSERT INTO labeling_scan_events (id, scanner_id, license_plate_code, labels_printed, status)
+              VALUES (@id, @scanner_id, @license_plate_code, @labels_printed, @status)`);
+
+    res.json({
+      success: true,
+      labels_printed: totalPrinted,
+      results: printResults,
+      event_id: eventId
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Helper function to substitute product variables
+function substituteProductVars(text, configData) {
+  if (!text) return text;
+  let result = text;
+
+  // Replace product variables
+  result = result.replace(/\{\{product\.(\w+)\}\}/g, (match, field) => {
+    const fieldMap = {
+      'gtin': configData.gtin,
+      'description': configData.product_description,
+      'company_name': configData.company_name,
+      'company_prefix': configData.company_prefix,
+      'item_reference': configData.item_reference,
+      'indicator_digit': configData.indicator_digit
+    };
+    const value = fieldMap[field];
+    return value !== undefined && value !== null ? String(value) : match;
+  });
+
+  // Replace lot_number and pack_date
+  result = result.replace(/\{\{lot_number\}\}/g, configData.lot_number || '');
+  result = result.replace(/\{\{pack_date\}\}/g, configData.pack_date || '');
+
+  // Generate voice pick code and replace
+  const gtin = configData.gtin || '00000000000000';
+  const lot = configData.lot_number || 'LOT';
+  const numericGtin = gtin.replace(/\D/g, '');
+  const last4 = numericGtin.slice(-4);
+  const lotFirst3 = (lot.replace(/\D/g, '') || '000').slice(0, 3).padEnd(3, '0');
+  const voicePickCode = `${last4}-${lotFirst3}`;
+  result = result.replace(/\{\{voice_pick\}\}/g, voicePickCode);
+
+  // Replace custom variables
+  const variableValues = configData.variable_values ?
+    (typeof configData.variable_values === 'string' ? JSON.parse(configData.variable_values) : configData.variable_values)
+    : {};
+  Object.entries(variableValues).forEach(([key, value]) => {
+    const regex = new RegExp(`\\{\\{custom\\.${key}\\}\\}`, 'g');
+    result = result.replace(regex, value || '');
+  });
+
+  return result;
+}
+
+// Helper function to generate ZPL from elements (simplified version)
+function generateZPLFromElements(elements, labelWidth, labelHeight) {
+  let zpl = `^XA\n^PW${labelWidth}\n^LL${labelHeight}\n^CI28\n`;
+
+  elements.filter(el => el.visible !== false).forEach(el => {
+    const x = Math.round(el.x || 0);
+    const y = Math.round(el.y || 0);
+
+    switch (el.type) {
+      case 'text':
+        zpl += `^FO${x},${y}\n^A0N,${el.fontSize || 24},${el.fontSize || 24}\n^FD${el.text || ''}^FS\n`;
+        break;
+      case 'barcode-gs1-128':
+        const barcodeData = (el.data || '').replace(/[()]/g, ''); // Strip parentheses
+        zpl += `^FO${x},${y}\n^BY${el.moduleWidth || 3}\n^BCN,${el.height || 80},${el.showText ? 'Y' : 'N'},N,N\n`;
+        zpl += `^FD>;>8${barcodeData}^FS\n`;
+        break;
+      case 'barcode-upc':
+        zpl += `^FO${x},${y}\n^BUN,${el.height || 70},${el.showText ? 'Y' : 'N'},N,N\n^FD${el.data || ''}^FS\n`;
+        break;
+      case 'barcode-ean':
+        zpl += `^FO${x},${y}\n^BEN,${el.height || 70},${el.showText ? 'Y' : 'N'},N\n^FD${el.data || ''}^FS\n`;
+        break;
+      case 'voicepick':
+        zpl += `^FO${x},${y}\n^GB${(el.width || 100) + 20},${(el.height || 50) + 10},2^FS\n`;
+        zpl += `^FO${x + 10},${y + 5}\n^A0N,${el.fontSize || 36},${el.fontSize || 36}\n^FD${el.text || ''}^FS\n`;
+        break;
+      case 'datebox':
+        zpl += `^FO${x},${y}\n^GB${el.width || 80},${el.height || 40},2^FS\n`;
+        zpl += `^FO${x + 5},${y + 10}\n^A0N,${el.fontSize || 18},${el.fontSize || 18}\n^FD${el.text || ''}^FS\n`;
+        break;
+      case 'box':
+        zpl += `^FO${x},${y}\n^GB${el.width || 100},${el.height || 50},${el.borderWidth || 2}^FS\n`;
+        break;
+      case 'line':
+        zpl += `^FO${x},${y}\n^GB${el.width || 200},${el.height || 2},${el.height || 2}^FS\n`;
+        break;
+    }
+  });
+
+  zpl += `^XZ`;
+  return zpl;
+}
+
+// Get scan event history
+app.get('/api/scan-events', async (req, res) => {
+  try {
+    if (!isConfigured()) {
+      return res.status(503).json({ success: false, error: 'Database not configured' });
+    }
+
+    const { scanner_id, limit = 100, offset = 0 } = req.query;
+    const pool = await getPool();
+
+    let query = `SELECT se.*, s.name as scanner_name
+                 FROM labeling_scan_events se
+                 JOIN labeling_scanners s ON se.scanner_id = s.id`;
+
+    if (scanner_id) {
+      query += ` WHERE se.scanner_id = @scannerId`;
+    }
+
+    query += ` ORDER BY se.scanned_at DESC
+               OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY`;
+
+    const request = pool.request()
+      .input('limit', sql.Int, parseInt(limit))
+      .input('offset', sql.Int, parseInt(offset));
+
+    if (scanner_id) {
+      request.input('scannerId', sql.UniqueIdentifier, scanner_id);
+    }
+
+    const result = await request.query(query);
+
+    res.json({ success: true, events: result.recordset });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Start server
+app.listen(PORT, () => {
+  console.log(`ZT411 Printer API Server running on port ${PORT}`);
+  console.log(`Loaded ${Object.keys(printers).length} printers`);
+  console.log(`\nAvailable endpoints:`);
+  console.log(`  GET    /api/health - Health check`);
+  console.log(`  GET    /api/printers - List all printers`);
+  console.log(`  POST   /api/printers - Add new printer`);
+  console.log(`  GET    /api/printers/:id - Get printer details`);
+  console.log(`  PUT    /api/printers/:id - Update printer`);
+  console.log(`  DELETE /api/printers/:id - Remove printer`);
+  console.log(`  GET    /api/printers/:id/status - Check printer status`);
+  console.log(`  GET    /api/printers/:id/peel-sensor - Get peel sensor status`);
+  console.log(`  POST   /api/printers/:id/print - Send print job (JSON)`);
+  console.log(`  POST   /api/printers/:id/print/raw - Send raw ZPL`);
+  console.log(`  POST   /api/printers/:id/print/continuous - Start continuous printing`);
+  console.log(`  POST   /api/printers/:id/print/continuous/stop - Stop continuous printing`);
+  console.log(`  GET    /api/printers/:id/print/continuous/status - Get continuous print status`);
+  console.log(`  POST   /api/printers/print/bulk - Send to multiple printers`);
+  console.log(`  POST   /api/scan - Handle scan event (trigger prints)`);
+  console.log(`  GET    /api/scanners - List scanners`);
+  console.log(`  GET    /api/scan-events - View scan history`);
+});
