@@ -95,7 +95,8 @@ process.on('SIGTERM', () => {
   process.exit(0);
 });
 
-app.listen(PORT, () => {
+// Listen on all interfaces (0.0.0.0) to allow outside connections
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`ZT411 Printer API Server running on port ${PORT}`);
   console.log(`Loaded ${Object.keys(getPrinters()).length} printers`);
   console.log(`\nAvailable endpoints:`);
