@@ -4,7 +4,7 @@
     "name": "ZT411-Test-Office",
     "description": "printer for testing",
     "addedAt": "2026-01-07T19:35:34.582Z",
-    "lastChecked": "2026-01-22T00:58:24.861Z",
+    "lastChecked": "2026-01-22T18:35:33.952Z",
     "status": "online",
     "lastPrint": "2026-01-21T23:37:15.924Z",
     "continuousPrint": {
@@ -21,7 +21,7 @@
     "name": "Shipping 1",
     "description": "",
     "addedAt": "2026-01-21T18:35:34.089Z",
-    "lastChecked": "2026-01-22T00:58:24.875Z",
+    "lastChecked": "2026-01-22T18:35:33.965Z",
     "status": "online",
     "lastPrint": "2026-01-21T18:48:23.355Z"
   }

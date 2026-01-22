@@ -1,4 +1,10 @@
-require('dotenv').config();
+// Load environment variables from custom path if specified (for Electron builds)
+const dotenvPath = process.env.DOTENV_CONFIG_PATH;
+if (dotenvPath) {
+  require('dotenv').config({ path: dotenvPath });
+} else {
+  require('dotenv').config();
+}
 const express = require('express');
 const cors = require('cors');
 const routes = require('./routes');
