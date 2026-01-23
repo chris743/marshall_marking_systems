@@ -159,7 +159,9 @@ async function processScan(scannerId, licensePlateCode) {
           return processed;
         });
 
-        const zpl = await generateZPLFromElements(processedElements, config.label_width, config.label_height);
+        const copies = config.copies || 1;
+        // Pass copies to ZPL generator - uses ^PQ command for bulk printing (single request)
+        const zpl = await generateZPLFromElements(processedElements, config.label_width, config.label_height, copies);
 
         const printer = getPrinter(config.printer_id);
         if (!printer) {
@@ -173,16 +175,15 @@ async function processScan(scannerId, licensePlateCode) {
           continue;
         }
 
-        for (let i = 0; i < (config.copies || 1); i++) {
-          await sendZPL(printer.ip, zpl);
-          totalPrinted++;
-        }
+        // Single request with ^PQ command handles multiple copies
+        await sendZPL(printer.ip, zpl);
+        totalPrinted += copies;
 
         printResults.push({
           location: config.location_name,
           location_number: config.location_number,
           printer: config.printer_id,
-          copies: config.copies || 1,
+          copies: copies,
           status: 'success'
         });
       } catch (printError) {

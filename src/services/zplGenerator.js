@@ -366,8 +366,14 @@ async function imageToZPL(base64Data, targetWidth, targetHeight) {
 }
 
 // Generate ZPL from elements (async to support image conversion)
-async function generateZPLFromElements(elements, labelWidth, labelHeight) {
+// quantity parameter adds ^PQ command for bulk printing
+async function generateZPLFromElements(elements, labelWidth, labelHeight, quantity = 1) {
   let zpl = `^XA\n^PW${labelWidth}\n^LL${labelHeight}\n^CI28\n`;
+
+  // Add print quantity command if more than 1 copy
+  if (quantity > 1) {
+    zpl += `^PQ${quantity},0,0,N\n`; // qty, pause, replicates, override
+  }
 
   for (const el of elements.filter(el => el.visible !== false)) {
     const x = Math.round(el.x || 0);
