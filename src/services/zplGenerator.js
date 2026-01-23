@@ -55,6 +55,48 @@ function generateVoicePickCode(gtin, lotNumber, packDate = '') {
   return `${code.slice(0, 2)}-${code.slice(2)}`;
 }
 
+// ========== Check Digit Calculation for UPC/EAN/GTIN ==========
+/**
+ * Calculate check digit using GS1/EAN/UPC standard algorithm
+ * Works for any length - calculates check digit for the input
+ * @param {string} digits - The digits without check digit
+ * @returns {string} The check digit (single character)
+ */
+function calculateCheckDigit(digits) {
+  const nums = digits.replace(/\D/g, '').split('').map(Number);
+  if (nums.length === 0) return '';
+
+  // GS1 standard: from right to left, odd positions * 3, even positions * 1
+  let sum = 0;
+  const len = nums.length;
+  for (let i = 0; i < len; i++) {
+    const multiplier = (len - i) % 2 === 0 ? 1 : 3;
+    sum += nums[i] * multiplier;
+  }
+  return ((10 - (sum % 10)) % 10).toString();
+}
+
+/**
+ * Auto-detect barcode type and add check digit if needed
+ * Handles UPC-A (11->12), EAN-13 (12->13), GTIN-14 (13->14)
+ * @param {string} code - Barcode digits
+ * @returns {string} Barcode with check digit
+ */
+function addBarcodeCheckDigit(code) {
+  if (!code) return code;
+  const digits = String(code).replace(/\D/g, '');
+  // If it's a standard length with check digit, return as-is
+  if (digits.length === 8 || digits.length === 12 || digits.length === 13 || digits.length === 14) {
+    return digits;
+  }
+  // Add check digit for lengths without
+  if (digits.length === 7) return digits + calculateCheckDigit(digits); // EAN-8
+  if (digits.length === 11) return digits + calculateCheckDigit(digits); // UPC-A
+  if (digits.length === 12) return digits + calculateCheckDigit(digits); // EAN-13
+  if (digits.length === 13) return digits + calculateCheckDigit(digits); // GTIN-14
+  return code; // Return original if unknown format
+}
+
 // Helper function to format dates in various formats with optional day offset
 function formatDate(packDate) {
   if (!packDate) return () => '';
@@ -140,7 +182,22 @@ function substituteProductVars(text, configData) {
 
   // Replace product variables dynamically with fallback support
   // Supports: {{product.field}} or {{product.field|fallback}}
+  // Special fields with _check suffix add check digit: {{product.gtin_check}}, {{product.external_upc_check}}
   result = result.replace(/\{\{product\.(\w+)(?:\|([^}]*))?\}\}/g, (match, field, fallback) => {
+    // Handle _check suffix for barcode check digit calculation
+    if (field.endsWith('_check')) {
+      const baseField = field.replace(/_check$/, '');
+      // Try multiple possible locations for the base field
+      let value = configData[baseField];
+      if (value === undefined) value = configData[`product_${baseField}`];
+      if (value === undefined && configData.product) value = configData.product[baseField];
+
+      if (value !== undefined && value !== null && value !== '') {
+        return addBarcodeCheckDigit(String(value));
+      }
+      return fallback !== undefined ? fallback : '';
+    }
+
     // Try multiple possible locations for the field
     let value = configData[field];                           // Direct field (e.g., gtin)
     if (value === undefined) value = configData[`product_${field}`];  // Prefixed (e.g., product_description)

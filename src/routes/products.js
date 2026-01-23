@@ -71,10 +71,10 @@ router.get('/', async (req, res) => {
   }
 });
 
-// Search products (autocomplete)
+// Search products (autocomplete) with fuzzy token matching
 router.get('/search', async (req, res) => {
   try {
-    const { q = '', limit = 20 } = req.query;
+    const { q = '', limit = 20, commodity = '' } = req.query;
 
     if (!q || q.length < 2) {
       return res.json({
@@ -84,18 +84,66 @@ router.get('/search', async (req, res) => {
     }
 
     const pool = await getPool();
-    const result = await pool.request()
-      .input('search', sql.NVarChar, `%${q}%`)
-      .input('limit', sql.Int, parseInt(limit))
-      .query(`
-        SELECT TOP (@limit) * FROM ${PRODUCTS_TABLE}
-        WHERE inactive = 0 AND (description LIKE @search OR gtin LIKE @search)
-        ORDER BY description
-      `);
+    const request = pool.request();
+
+    // Split query into tokens (by space, dash, underscore, or other separators)
+    // Keep numbers with adjacent letters/dashes together (e.g., "10-4lb" stays as one token)
+    const tokens = q.trim().split(/[\s]+/).filter(t => t.length > 0);
+
+    // Build WHERE clause with token matching
+    // Each token must appear somewhere in description OR the whole query matches gtin
+    const conditions = ['inactive = 0'];
+
+    if (tokens.length > 0) {
+      const tokenConditions = tokens.map((token, i) => {
+        request.input(`token${i}`, sql.NVarChar, `%${token}%`);
+        return `description LIKE @token${i}`;
+      });
+      // All tokens must match in description, OR the original query matches gtin
+      request.input('gtin', sql.NVarChar, `%${q}%`);
+      conditions.push(`((${tokenConditions.join(' AND ')}) OR gtin LIKE @gtin)`);
+    }
+
+    // Optional commodity filter
+    if (commodity) {
+      request.input('commodity', sql.NVarChar, commodity);
+      conditions.push('commodity = @commodity');
+    }
+
+    request.input('limit', sql.Int, parseInt(limit));
+
+    const result = await request.query(`
+      SELECT TOP (@limit) * FROM ${PRODUCTS_TABLE}
+      WHERE ${conditions.join(' AND ')}
+      ORDER BY description
+    `);
 
     res.json({
       success: true,
       products: result.recordset
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Get distinct commodities for drill-down filter
+router.get('/commodities', async (req, res) => {
+  try {
+    const pool = await getPool();
+    const result = await pool.request().query(`
+      SELECT DISTINCT LTRIM(RTRIM(commodity)) as commodity
+      FROM ${PRODUCTS_TABLE}
+      WHERE inactive = 0 AND commodity IS NOT NULL AND LTRIM(RTRIM(commodity)) != ''
+      ORDER BY commodity
+    `);
+
+    res.json({
+      success: true,
+      commodities: result.recordset.map(r => r.commodity)
     });
   } catch (error) {
     res.status(500).json({
