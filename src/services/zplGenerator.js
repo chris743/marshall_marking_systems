@@ -389,15 +389,54 @@ async function generateZPLFromElements(elements, labelWidth, labelHeight, quanti
         zpl += `^FD>;>8${barcodeData}^FS\n`;
         break;
       case 'barcode-upc':
-        zpl += `^FO${x},${y}\n^BUN,${el.height || 70},${el.showText ? 'Y' : 'N'},N,N\n^FD${el.data || ''}^FS\n`;
+        // Add check digit if needed (11 digits -> 12)
+        // ^BU params: orientation, height, interpretation line, interp above (N), print check digit (Y)
+        const upcData = addBarcodeCheckDigit(el.data || '');
+        zpl += `^FO${x},${y}\n^BUN,${el.height || 70},${el.showText ? 'Y' : 'N'},N,Y\n^FD${upcData}^FS\n`;
         break;
       case 'barcode-ean':
-        zpl += `^FO${x},${y}\n^BEN,${el.height || 70},${el.showText ? 'Y' : 'N'},N\n^FD${el.data || ''}^FS\n`;
+        // Add check digit if needed (12 digits -> 13)
+        // ^BE params: orientation, height, interpretation line, interp above (N), print check digit (Y)
+        const eanData = addBarcodeCheckDigit(el.data || '');
+        zpl += `^FO${x},${y}\n^BEN,${el.height || 70},${el.showText ? 'Y' : 'N'},N,Y\n^FD${eanData}^FS\n`;
         break;
-      case 'voicepick':
-        zpl += `^FO${x},${y}\n^GB${(el.width || 100) + 20},${(el.height || 50) + 10},2^FS\n`;
-        zpl += `^FO${x + 10},${y + 5}\n^A0N,${el.fontSize || 36},${el.fontSize || 36}\n^FD${el.text || ''}^FS\n`;
+      case 'voicepick': {
+        // Voice pick code format: "XX-XX" - first pair large, second pair small, inverted colors, no dash
+        const voiceCode = el.text || '';
+        const parts = voiceCode.split('-');
+        const firstPair = parts[0] || '00';
+        const secondPair = parts[1] || '00';
+
+        const boxWidth = el.width || 100;
+        const boxHeight = el.height || 50;
+        const largeFontSize = el.fontSize || 36;
+        const smallFontSize = Math.round(largeFontSize * 0.6);
+
+        // Draw filled black box (inverted background)
+        zpl += `^FO${x},${y}\n`;
+        zpl += `^GB${boxWidth},${boxHeight},${boxHeight},B^FS\n`;
+
+        // Calculate positions - font width is approx 0.6x height for ZPL default font
+        const largeCharWidth = Math.round(largeFontSize * 0.6);
+        const smallCharWidth = Math.round(smallFontSize * 0.6);
+        const gap = 4;
+        const totalWidth = (largeCharWidth * 2) + gap + (smallCharWidth * 2);
+        const startX = x + Math.round((boxWidth - totalWidth) / 2);
+        const largeY = y + Math.round((boxHeight - largeFontSize) / 2);
+        const smallY = y + Math.round((boxHeight - smallFontSize) / 2);
+
+        // First pair - large white text (field reverse)
+        zpl += `^FO${startX},${largeY}\n`;
+        zpl += `^FR^A0N,${largeFontSize},${largeFontSize}\n`;
+        zpl += `^FD${firstPair}^FS\n`;
+
+        // Second pair - small white text
+        const secondX = startX + (largeCharWidth * 2) + gap;
+        zpl += `^FO${secondX},${smallY}\n`;
+        zpl += `^FR^A0N,${smallFontSize},${smallFontSize}\n`;
+        zpl += `^FD${secondPair}^FS\n`;
         break;
+      }
       case 'datebox':
         zpl += `^FO${x},${y}\n^GB${el.width || 80},${el.height || 40},2^FS\n`;
         zpl += `^FO${x + 5},${y + 10}\n^A0N,${el.fontSize || 18},${el.fontSize || 18}\n^FD${el.text || ''}^FS\n`;

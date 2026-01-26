@@ -4,9 +4,9 @@
     "name": "ZT411-Test-Office",
     "description": "printer for testing",
     "addedAt": "2026-01-07T19:35:34.582Z",
-    "lastChecked": "2026-01-23T22:27:50.040Z",
-    "status": "offline",
-    "lastPrint": "2026-01-21T23:37:15.924Z",
+    "lastChecked": "2026-01-23T23:58:53.270Z",
+    "status": "online",
+    "lastPrint": "2026-01-26T17:09:27.063Z",
     "continuousPrint": {
       "active": false,
       "zpl": "^XA\n^PW812\n^LL406\n^CI28\n^FO100,140\n^BY3\n^BCN,80,N,N,N\n^FD>;>801107919284075271326012010123456^FS\n^FO20,60\n^A0N,28,28\n^FD1/2 CTN CHOICE 018^FS\n^FO500,20\n^A0N,32,32\n^FDPROD. OF CA-USA^FS\n^FO20,320\n^A0N,26,26\n^FDKings River Packing^FS\n^FO20,350\n^A0N,26,26\n^FDSanger, CA 93657^FS\n^FO300,320\n^BUN,50,Y,N,N\n^FD791928044923^FS\n^FO660,260\n^A0N,18,18\n^FDPack Date^FS\n^FO660,320\n^GB120,60,2^FS\n^FO670,325\n^A0N,36,36\n^FD96-53^FS\n^FO660,280\n^A0N,24,24\n^FDJAN20^FS\n^FO20,20\n^A0N,32,32\n^FDGRAPEFRUIT RED^FS\n^FO220,228\n^A0N,20,20\n^FD(01)10791928407527(13)260120(10)123456^FS\n^FO400,280\n^A0N,24,24\n^FD01/21/26^FS\n^XZ",
@@ -21,7 +21,7 @@
     "name": "Shipping 1",
     "description": "",
     "addedAt": "2026-01-21T18:35:34.089Z",
-    "lastChecked": "2026-01-23T22:27:50.142Z",
+    "lastChecked": "2026-01-23T23:58:53.301Z",
     "status": "online",
     "lastPrint": "2026-01-21T18:48:23.355Z"
   }
