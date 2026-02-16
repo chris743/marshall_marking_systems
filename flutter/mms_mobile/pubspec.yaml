@@ -1,0 +1,38 @@
+name: mms_mobile
+description: "MMS Mobile - Label printing workflows"
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.9.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+
+  # HTTP client
+  http: ^1.2.0
+
+  # State management
+  provider: ^6.1.2
+
+  # Routing
+  go_router: ^14.6.2
+
+  # Barcode scanning
+  mobile_scanner: ^6.0.2
+
+  # Local storage
+  shared_preferences: ^2.3.3
+
+  # UI helpers
+  flutter_typeahead: ^5.2.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true

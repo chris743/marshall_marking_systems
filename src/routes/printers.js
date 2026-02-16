@@ -39,7 +39,7 @@ router.get('/:id', (req, res) => {
 // Add a new printer
 router.post('/', async (req, res) => {
   try {
-    const { ip, name, description } = req.body;
+    const { ip, name, description, driver } = req.body;
 
     if (!ip) {
       return res.status(400).json({
@@ -56,13 +56,15 @@ router.post('/', async (req, res) => {
       });
     }
 
+    const printerDriver = driver || 'zebra';
     const id = `printer_${Date.now()}`;
-    const status = await checkPrinterStatus(ip);
+    const status = await checkPrinterStatus(ip, printerDriver);
 
     const printerData = {
       ip,
-      name: name || `ZT411-${ip}`,
+      name: name || `Printer-${ip}`,
       description: description || '',
+      driver: printerDriver,
       addedAt: new Date().toISOString(),
       lastChecked: new Date().toISOString(),
       status: status.online ? 'online' : 'offline'
@@ -88,7 +90,7 @@ router.post('/', async (req, res) => {
 router.put('/:id', (req, res) => {
   try {
     const { id } = req.params;
-    const { ip, name, description } = req.body;
+    const { ip, name, description, driver } = req.body;
     const printer = getPrinter(id);
 
     if (!printer) {
@@ -110,6 +112,7 @@ router.put('/:id', (req, res) => {
     }
     if (name) printer.name = name;
     if (description !== undefined) printer.description = description;
+    if (driver) printer.driver = driver;
 
     printer.updatedAt = new Date().toISOString();
     setPrinter(id, printer);
@@ -171,7 +174,7 @@ router.get('/:id/status', async (req, res) => {
     }
 
     console.log(`\nChecking status for printer: ${printer.name} (${printer.ip})`);
-    const status = await checkPrinterStatus(printer.ip);
+    const status = await checkPrinterStatus(printer.ip, printer.driver || 'zebra');
 
     const newStatus = status.online ? 'online' : 'offline';
     console.log(`Status result: ${newStatus}`);
@@ -208,7 +211,7 @@ router.get('/:id/peel-sensor', async (req, res) => {
       });
     }
 
-    const peelStatus = await getPeelSensorStatus(printer.ip);
+    const peelStatus = await getPeelSensorStatus(printer.ip, printer.driver || 'zebra');
 
     res.json({
       success: true,

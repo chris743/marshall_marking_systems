@@ -2,7 +2,7 @@ const crypto = require('crypto');
 const { sql, getPool, isConnected } = require('../../sqlServerClient');
 const { getPrinter } = require('./printerStore');
 const { sendZPL } = require('./printerService');
-const { substituteProductVars, generateZPLFromElements } = require('./zplGenerator');
+const { substituteProductVars, generateZPLFromElements } = require('./zpl');
 const { PRODUCTS_TABLE } = require('../config/constants');
 
 /**
@@ -176,7 +176,7 @@ async function processScan(scannerId, licensePlateCode) {
         }
 
         // Single request with ^PQ command handles multiple copies
-        await sendZPL(printer.ip, zpl);
+        await sendZPL(printer.ip, zpl, { driver: printer.driver || 'zebra' });
         totalPrinted += copies;
 
         printResults.push({

@@ -25,7 +25,8 @@ router.post('/:id/print', async (req, res) => {
       });
     }
 
-    await sendZPL(printer.ip, zpl);
+    const driver = printer.driver || 'zebra';
+    await sendZPL(printer.ip, zpl, { driver });
 
     printer.lastPrint = new Date().toISOString();
     printer.status = 'online';
@@ -76,7 +77,8 @@ router.post('/:id/print/raw', async (req, res) => {
       });
     }
 
-    await sendZPL(printer.ip, zpl);
+    const driver = printer.driver || 'zebra';
+    await sendZPL(printer.ip, zpl, { driver });
 
     printer.lastPrint = new Date().toISOString();
     printer.status = 'online';
@@ -138,7 +140,8 @@ router.post('/print/bulk', async (req, res) => {
       }
 
       try {
-        await sendZPL(printers[id].ip, zpl);
+        const bulkDriver = printers[id].driver || 'zebra';
+        await sendZPL(printers[id].ip, zpl, { driver: bulkDriver });
         printers[id].lastPrint = new Date().toISOString();
         printers[id].status = 'online';
         results.push({
@@ -219,7 +222,8 @@ router.post('/:id/print/continuous', async (req, res) => {
 
     // Start continuous printing loop
     const continuousPrintLoop = async () => {
-      console.log(`Starting continuous print for ${printer.name} - using SGD sensor.peeler command`);
+      const contDriver = printer.driver || 'zebra';
+      console.log(`Starting continuous print for ${printer.name} (driver: ${contDriver}) - using SGD sensor.peeler command`);
       console.log(`Strategy: Maintaining 2-label queue (1 presented + 1 in buffer)`);
 
       let labelsInQueue = 0;
@@ -230,7 +234,7 @@ router.post('/:id/print/continuous', async (req, res) => {
       for (let i = 0; i < TARGET_QUEUE_SIZE; i++) {
         try {
           const currentPrinter = getPrinter(id);
-          await sendZPL(printer.ip, currentPrinter.continuousPrint.zpl);
+          await sendZPL(printer.ip, currentPrinter.continuousPrint.zpl, { driver: contDriver });
           currentPrinter.continuousPrint.count++;
           labelsInQueue++;
           console.log(`  → Queued label ${currentPrinter.continuousPrint.count} (queue size: ${labelsInQueue})`);
@@ -256,7 +260,7 @@ router.post('/:id/print/continuous', async (req, res) => {
         }
 
         try {
-          const peelStatus = await getPeelSensorStatus(currentPrinter.ip);
+          const peelStatus = await getPeelSensorStatus(currentPrinter.ip, contDriver);
 
           console.log(`[DEBUG] Peel sensor for ${currentPrinter.name}:`, {
             sensorValue: peelStatus.sensorValue,
@@ -277,7 +281,7 @@ router.post('/:id/print/continuous', async (req, res) => {
             if (labelsInQueue < TARGET_QUEUE_SIZE) {
               console.log(`Replenishing: printing label ${currentPrinter.continuousPrint.count + 1} to ${currentPrinter.name}`);
 
-              await sendZPL(currentPrinter.ip, currentPrinter.continuousPrint.zpl);
+              await sendZPL(currentPrinter.ip, currentPrinter.continuousPrint.zpl, { driver: contDriver });
               currentPrinter.continuousPrint.count++;
               labelsInQueue++;
               currentPrinter.lastPrint = new Date().toISOString();
