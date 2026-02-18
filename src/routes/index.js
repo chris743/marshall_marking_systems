@@ -12,6 +12,10 @@ const scannerRoutes = require('./scanners');
 const scanLocationRoutes = require('./scanLocations');
 const licensePlateRoutes = require('./licensePlates');
 const scanEventRoutes = require('./scanEvents');
+const groupRoutes = require('./groups');
+const groupConfigRoutes = require('./groupConfigs');
+const groupScannerRoutes = require('./groupScanners');
+const locationCodeRoutes = require('./locationCodes');
 
 // Health check
 router.use('/health', healthRoutes);
@@ -46,5 +50,11 @@ router.use('/', licensePlateRoutes);
 
 // Scan events
 router.use('/', scanEventRoutes);
+
+// Groups and location codes
+router.use('/', groupRoutes);
+router.use('/', groupConfigRoutes);
+router.use('/', groupScannerRoutes);
+router.use('/', locationCodeRoutes);
 
 module.exports = router;

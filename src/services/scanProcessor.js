@@ -65,22 +65,27 @@ async function processScan(scannerId, licensePlateCode) {
     const pool = await getPool();
     const eventId = crypto.randomUUID();
 
+    // Query through group model: group_scanners → groups → group_configs → location_codes
     // First try exact match for the scanned code
     let configsResult = await pool.request()
       .input('scannerId', sql.UniqueIdentifier, scannerId)
       .input('code', sql.VarChar, licensePlateCode)
-      .query(`SELECT lpc.*, sl.printer_id, sl.name as location_name, sl.location_number,
+      .query(`SELECT gc.*, g.printer_id, g.name as group_name,
+              lc.code as location_code,
               t.elements, t.label_width, t.label_height, t.name as template_name,
               p.*
-              FROM labeling_license_plate_configs lpc
-              JOIN labeling_scan_locations sl ON lpc.location_id = sl.id
-              LEFT JOIN labeling_templates t ON lpc.template_id = t.id
-              LEFT JOIN ${PRODUCTS_TABLE} p ON lpc.product_id = p.id
-              WHERE sl.scanner_id = @scannerId
-              AND lpc.license_plate_code = @code
-              AND lpc.enabled = 1
-              AND sl.enabled = 1
-              ORDER BY sl.location_number`);
+              FROM labeling_group_scanners gs
+              JOIN labeling_groups g ON g.id = gs.group_id
+              JOIN labeling_group_configs gc ON gc.group_id = g.id
+              JOIN labeling_location_codes lc ON gc.location_code_id = lc.id
+              LEFT JOIN labeling_templates t ON gc.template_id = t.id
+              LEFT JOIN ${PRODUCTS_TABLE} p ON gc.product_id = p.id
+              WHERE gs.scanner_id = @scannerId
+              AND lc.code = @code
+              AND gc.enabled = 1
+              AND g.enabled = 1
+              AND lc.enabled = 1
+              ORDER BY g.name`);
 
     let configs = configsResult.recordset;
 
@@ -88,18 +93,22 @@ async function processScan(scannerId, licensePlateCode) {
     if (configs.length === 0 && licensePlateCode !== 'DEFAULT') {
       configsResult = await pool.request()
         .input('scannerId', sql.UniqueIdentifier, scannerId)
-        .query(`SELECT lpc.*, sl.printer_id, sl.name as location_name, sl.location_number,
+        .query(`SELECT gc.*, g.printer_id, g.name as group_name,
+                lc.code as location_code,
                 t.elements, t.label_width, t.label_height, t.name as template_name,
                 p.*
-                FROM labeling_license_plate_configs lpc
-                JOIN labeling_scan_locations sl ON lpc.location_id = sl.id
-                LEFT JOIN labeling_templates t ON lpc.template_id = t.id
-                LEFT JOIN ${PRODUCTS_TABLE} p ON lpc.product_id = p.id
-                WHERE sl.scanner_id = @scannerId
-                AND lpc.license_plate_code = 'DEFAULT'
-                AND lpc.enabled = 1
-                AND sl.enabled = 1
-                ORDER BY sl.location_number`);
+                FROM labeling_group_scanners gs
+                JOIN labeling_groups g ON g.id = gs.group_id
+                JOIN labeling_group_configs gc ON gc.group_id = g.id
+                JOIN labeling_location_codes lc ON gc.location_code_id = lc.id
+                LEFT JOIN labeling_templates t ON gc.template_id = t.id
+                LEFT JOIN ${PRODUCTS_TABLE} p ON gc.product_id = p.id
+                WHERE gs.scanner_id = @scannerId
+                AND lc.code = 'DEFAULT'
+                AND gc.enabled = 1
+                AND g.enabled = 1
+                AND lc.enabled = 1
+                ORDER BY g.name`);
         configs = configsResult.recordset;
     }
 
@@ -135,8 +144,7 @@ async function processScan(scannerId, licensePlateCode) {
     for (const config of configs) {
       if (!config.printer_id || !config.elements) {
         printResults.push({
-          location: config.location_name,
-          location_number: config.location_number,
+          group: config.group_name,
           status: 'skipped',
           reason: !config.printer_id ? 'No printer assigned' : 'No template configured'
         });
@@ -166,8 +174,7 @@ async function processScan(scannerId, licensePlateCode) {
         const printer = getPrinter(config.printer_id);
         if (!printer) {
           printResults.push({
-            location: config.location_name,
-            location_number: config.location_number,
+            group: config.group_name,
             status: 'error',
             reason: `Printer ${config.printer_id} not found`
           });
@@ -180,16 +187,14 @@ async function processScan(scannerId, licensePlateCode) {
         totalPrinted += copies;
 
         printResults.push({
-          location: config.location_name,
-          location_number: config.location_number,
+          group: config.group_name,
           printer: config.printer_id,
           copies: copies,
           status: 'success'
         });
       } catch (printError) {
         printResults.push({
-          location: config.location_name,
-          location_number: config.location_number,
+          group: config.group_name,
           status: 'error',
           reason: printError.message
         });
