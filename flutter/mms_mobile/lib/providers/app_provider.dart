@@ -7,6 +7,7 @@ import '../services/api_service.dart';
 
 class AppProvider extends ChangeNotifier {
   late ApiService _api;
+  ApiService get api => _api;
 
   // Data
   List<Printer> _printers = [];

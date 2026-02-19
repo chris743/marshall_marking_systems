@@ -6,6 +6,7 @@ import 'screens/home_screen.dart';
 import 'screens/manual_print_screen.dart';
 import 'screens/scanner_screen.dart';
 import 'screens/settings_screen.dart';
+import 'screens/station_config_screen.dart';
 
 void main() {
   runApp(const MMSMobileApp());
@@ -29,6 +30,10 @@ final _router = GoRouter(
     GoRoute(
       path: '/settings',
       builder: (context, state) => const SettingsScreen(),
+    ),
+    GoRoute(
+      path: '/station-config',
+      builder: (context, state) => const StationConfigScreen(),
     ),
   ],
 );

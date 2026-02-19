@@ -4,6 +4,7 @@ import '../models/printer.dart';
 import '../models/template.dart';
 import '../models/product.dart';
 import '../models/scanner.dart';
+import '../models/labeling_group.dart';
 
 class ApiService {
   final String baseUrl;
@@ -172,6 +173,175 @@ class ApiService {
       final data = json.decode(response.body);
       throw Exception(data['error'] ?? 'Scan processing failed');
     }
+  }
+
+  // ============ GROUPS ============
+
+  Future<List<LabelingGroup>> getGroups() async {
+    final response = await _client.get(Uri.parse('$baseUrl/api/groups'));
+    if (response.statusCode == 200) {
+      final data = json.decode(response.body);
+      if (data['success'] == true) {
+        return (data['groups'] as List)
+            .map((g) => LabelingGroup.fromJson(g))
+            .toList();
+      }
+    }
+    throw Exception('Failed to load groups');
+  }
+
+  Future<LabelingGroup> createGroup({
+    required String name,
+    String? description,
+    String? printerId,
+  }) async {
+    final response = await _client.post(
+      Uri.parse('$baseUrl/api/groups'),
+      headers: {'Content-Type': 'application/json'},
+      body: json.encode({
+        'name': name,
+        'description': description,
+        'printer_id': printerId,
+      }),
+    );
+    final data = json.decode(response.body);
+    if (data['success'] == true) {
+      return LabelingGroup.fromJson(data['group']);
+    }
+    throw Exception(data['error'] ?? 'Failed to create group');
+  }
+
+  Future<void> updateGroup(String id, {
+    required String name,
+    String? description,
+    bool? enabled,
+    String? printerId,
+  }) async {
+    final response = await _client.put(
+      Uri.parse('$baseUrl/api/groups/$id'),
+      headers: {'Content-Type': 'application/json'},
+      body: json.encode({
+        'name': name,
+        'description': description,
+        'enabled': enabled,
+        'printer_id': printerId,
+      }),
+    );
+    final data = json.decode(response.body);
+    if (data['success'] != true) {
+      throw Exception(data['error'] ?? 'Failed to update group');
+    }
+  }
+
+  Future<void> deleteGroup(String id) async {
+    final response = await _client.delete(Uri.parse('$baseUrl/api/groups/$id'));
+    final data = json.decode(response.body);
+    if (data['success'] != true) {
+      throw Exception(data['error'] ?? 'Failed to delete group');
+    }
+  }
+
+  // ============ GROUP CONFIGS ============
+
+  Future<List<GroupConfig>> getGroupConfigs(String groupId) async {
+    final response = await _client.get(
+      Uri.parse('$baseUrl/api/groups/$groupId/configs'),
+    );
+    final data = json.decode(response.body);
+    if (data['success'] == true) {
+      return (data['configs'] as List)
+          .map((c) => GroupConfig.fromJson(c))
+          .toList();
+    }
+    throw Exception('Failed to load group configs');
+  }
+
+  Future<void> saveGroupConfig(Map<String, dynamic> configData) async {
+    final response = await _client.post(
+      Uri.parse('$baseUrl/api/group-configs'),
+      headers: {'Content-Type': 'application/json'},
+      body: json.encode(configData),
+    );
+    final data = json.decode(response.body);
+    if (data['success'] != true) {
+      throw Exception(data['error'] ?? 'Failed to save config');
+    }
+  }
+
+  Future<void> deleteGroupConfig(String configId) async {
+    final response = await _client.delete(
+      Uri.parse('$baseUrl/api/group-configs/$configId'),
+    );
+    final data = json.decode(response.body);
+    if (data['success'] != true) {
+      throw Exception(data['error'] ?? 'Failed to delete config');
+    }
+  }
+
+  // ============ GROUP SCANNERS ============
+
+  Future<List<GroupScanner>> getGroupScanners(String groupId) async {
+    final response = await _client.get(
+      Uri.parse('$baseUrl/api/groups/$groupId/scanners'),
+    );
+    final data = json.decode(response.body);
+    if (data['success'] == true) {
+      return (data['scanners'] as List)
+          .map((s) => GroupScanner.fromJson(s))
+          .toList();
+    }
+    throw Exception('Failed to load group scanners');
+  }
+
+  Future<void> assignScanner(String groupId, String scannerId) async {
+    final response = await _client.post(
+      Uri.parse('$baseUrl/api/groups/$groupId/scanners'),
+      headers: {'Content-Type': 'application/json'},
+      body: json.encode({'scanner_id': scannerId}),
+    );
+    final data = json.decode(response.body);
+    if (data['success'] != true) {
+      throw Exception(data['error'] ?? 'Failed to assign scanner');
+    }
+  }
+
+  Future<void> unassignScanner(String groupId, String scannerId) async {
+    final response = await _client.delete(
+      Uri.parse('$baseUrl/api/groups/$groupId/scanners/$scannerId'),
+    );
+    final data = json.decode(response.body);
+    if (data['success'] != true) {
+      throw Exception(data['error'] ?? 'Failed to unassign scanner');
+    }
+  }
+
+  // ============ LOCATION CODES ============
+
+  Future<List<LocationCode>> getLocationCodes() async {
+    final response = await _client.get(Uri.parse('$baseUrl/api/location-codes'));
+    final data = json.decode(response.body);
+    if (data['success'] == true) {
+      return (data['codes'] as List)
+          .map((c) => LocationCode.fromJson(c))
+          .toList();
+    }
+    throw Exception('Failed to load location codes');
+  }
+
+  Future<LocationCode> createLocationCode({
+    required String code,
+    String? description,
+  }) async {
+    final response = await _client.post(
+      Uri.parse('$baseUrl/api/location-codes'),
+      headers: {'Content-Type': 'application/json'},
+      body: json.encode({'code': code, 'description': description}),
+    );
+    final data = json.decode(response.body);
+    if (data['success'] == true) {
+      return LocationCode.fromJson(data['code']);
+    }
+    throw Exception(data['error'] ?? 'Failed to create location code');
   }
 
   void dispose() {
